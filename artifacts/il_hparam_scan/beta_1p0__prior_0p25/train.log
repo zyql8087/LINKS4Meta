@@ -1,0 +1,200 @@
+Training IL on device: cuda
+[*] Loading cached IL dataset from f:/LINKS4Meta/LINKS-main/il_expert_paths_80k.pt
+[*] Total expert paths: 80000
+[*] Using fixed split from artifacts/il_split_indices.pt | train=64000 val=8000 test=8000 seed=42
+
+[*] Pre-batching data to GPU (one-time cost) ...
+  Pre-batching 64000 samples to cuda (batch_size=4096) ...
+  Pre-batching done: 16 batches cached on cuda
+  Pre-batching 8000 samples to cuda (batch_size=4096) ...
+  Pre-batching done: 2 batches cached on cuda
+  Pre-batching 8000 samples to cuda (batch_size=4096) ...
+  Pre-batching done: 2 batches cached on cuda
+[*] Model params: 1.02M | Batch size: 4096 | Train batches/epoch: 16
+
+[*] Starting IL pre-training for 100 epochs ...
+Epoch [  1/100]  Train Opt: 5.961556  Train Prior: 4.893045  Val Prior: 3.597716  Train Topo: 0.608803  Val Topo: 0.595926  Train GeoPrior: 4.284242  Val GeoPrior: 3.001790
+  [OK] Best model saved (val_prior=3.597716)
+Epoch [  2/100]  Train Opt: 3.433422  Train Prior: 2.870869  Val Prior: 2.259384  Train Topo: 0.532613  Val Topo: 0.513960  Train GeoPrior: 2.338256  Val GeoPrior: 1.745423
+  [OK] Best model saved (val_prior=2.259384)
+Epoch [  3/100]  Train Opt: 2.388671  Train Prior: 2.033690  Val Prior: 1.850047  Train Topo: 0.469290  Val Topo: 0.449453  Train GeoPrior: 1.564400  Val GeoPrior: 1.400595
+  [OK] Best model saved (val_prior=1.850047)
+Epoch [  4/100]  Train Opt: 1.991522  Train Prior: 1.766541  Val Prior: 1.628305  Train Topo: 0.413929  Val Topo: 0.382313  Train GeoPrior: 1.352612  Val GeoPrior: 1.245992
+  [OK] Best model saved (val_prior=1.628305)
+Epoch [  5/100]  Train Opt: 1.610137  Train Prior: 1.602572  Val Prior: 1.553362  Train Topo: 0.377266  Val Topo: 0.358115  Train GeoPrior: 1.225306  Val GeoPrior: 1.195246
+  [OK] Best model saved (val_prior=1.553362)
+Epoch [  6/100]  Train Opt: 1.349976  Train Prior: 1.510932  Val Prior: 1.449646  Train Topo: 0.360995  Val Topo: 0.351489  Train GeoPrior: 1.149937  Val GeoPrior: 1.098157
+  [OK] Best model saved (val_prior=1.449646)
+Epoch [  7/100]  Train Opt: 1.198814  Train Prior: 1.446036  Val Prior: 1.367144  Train Topo: 0.354249  Val Topo: 0.348110  Train GeoPrior: 1.091787  Val GeoPrior: 1.019034
+  [OK] Best model saved (val_prior=1.367144)
+Epoch [  8/100]  Train Opt: 1.095271  Train Prior: 1.394232  Val Prior: 1.329432  Train Topo: 0.351510  Val Topo: 0.349716  Train GeoPrior: 1.042722  Val GeoPrior: 0.979715
+  [OK] Best model saved (val_prior=1.329432)
+Epoch [  9/100]  Train Opt: 1.006613  Train Prior: 1.342884  Val Prior: 1.259906  Train Topo: 0.349378  Val Topo: 0.347106  Train GeoPrior: 0.993506  Val GeoPrior: 0.912800
+  [OK] Best model saved (val_prior=1.259906)
+Epoch [ 10/100]  Train Opt: 0.938945  Train Prior: 1.296328  Val Prior: 1.231431  Train Topo: 0.347882  Val Topo: 0.347656  Train GeoPrior: 0.948447  Val GeoPrior: 0.883776
+  [OK] Best model saved (val_prior=1.231431)
+Epoch [ 11/100]  Train Opt: 0.902176  Train Prior: 1.258988  Val Prior: 1.191504  Train Topo: 0.347156  Val Topo: 0.345686  Train GeoPrior: 0.911832  Val GeoPrior: 0.845818
+  [OK] Best model saved (val_prior=1.191504)
+Epoch [ 12/100]  Train Opt: 0.877994  Train Prior: 1.222815  Val Prior: 1.143245  Train Topo: 0.347044  Val Topo: 0.344958  Train GeoPrior: 0.875771  Val GeoPrior: 0.798287
+  [OK] Best model saved (val_prior=1.143245)
+Epoch [ 13/100]  Train Opt: 0.860188  Train Prior: 1.192707  Val Prior: 1.121473  Train Topo: 0.346546  Val Topo: 0.345257  Train GeoPrior: 0.846161  Val GeoPrior: 0.776216
+  [OK] Best model saved (val_prior=1.121473)
+Epoch [ 14/100]  Train Opt: 0.844547  Train Prior: 1.164509  Val Prior: 1.092346  Train Topo: 0.346110  Val Topo: 0.344672  Train GeoPrior: 0.818399  Val GeoPrior: 0.747674
+  [OK] Best model saved (val_prior=1.092346)
+Epoch [ 15/100]  Train Opt: 0.828696  Train Prior: 1.135401  Val Prior: 1.058720  Train Topo: 0.345584  Val Topo: 0.344638  Train GeoPrior: 0.789816  Val GeoPrior: 0.714082
+  [OK] Best model saved (val_prior=1.058720)
+Epoch [ 16/100]  Train Opt: 0.817057  Train Prior: 1.113335  Val Prior: 1.044213  Train Topo: 0.345573  Val Topo: 0.345191  Train GeoPrior: 0.767762  Val GeoPrior: 0.699022
+  [OK] Best model saved (val_prior=1.044213)
+Epoch [ 17/100]  Train Opt: 0.808174  Train Prior: 1.095745  Val Prior: 1.024329  Train Topo: 0.345233  Val Topo: 0.344020  Train GeoPrior: 0.750513  Val GeoPrior: 0.680309
+  [OK] Best model saved (val_prior=1.024329)
+Epoch [ 18/100]  Train Opt: 0.800730  Train Prior: 1.081628  Val Prior: 1.017377  Train Topo: 0.345234  Val Topo: 0.343982  Train GeoPrior: 0.736394  Val GeoPrior: 0.673395
+  [OK] Best model saved (val_prior=1.017377)
+Epoch [ 19/100]  Train Opt: 0.796464  Train Prior: 1.076547  Val Prior: 1.000413  Train Topo: 0.344879  Val Topo: 0.344152  Train GeoPrior: 0.731668  Val GeoPrior: 0.656261
+  [OK] Best model saved (val_prior=1.000413)
+Epoch [ 20/100]  Train Opt: 0.786599  Train Prior: 1.056326  Val Prior: 0.985684  Train Topo: 0.344532  Val Topo: 0.343985  Train GeoPrior: 0.711794  Val GeoPrior: 0.641699
+  [OK] Best model saved (val_prior=0.985684)
+Epoch [ 21/100]  Train Opt: 0.780481  Train Prior: 1.045327  Val Prior: 0.975946  Train Topo: 0.344313  Val Topo: 0.343819  Train GeoPrior: 0.701014  Val GeoPrior: 0.632127
+  [OK] Best model saved (val_prior=0.975946)
+Epoch [ 22/100]  Train Opt: 0.779931  Train Prior: 1.046072  Val Prior: 0.981715  Train Topo: 0.344433  Val Topo: 0.343532  Train GeoPrior: 0.701639  Val GeoPrior: 0.638183
+Epoch [ 23/100]  Train Opt: 0.776252  Train Prior: 1.041287  Val Prior: 0.981508  Train Topo: 0.344089  Val Topo: 0.343704  Train GeoPrior: 0.697198  Val GeoPrior: 0.637803
+Epoch [ 24/100]  Train Opt: 0.769038  Train Prior: 1.025933  Val Prior: 0.960239  Train Topo: 0.344115  Val Topo: 0.343435  Train GeoPrior: 0.681818  Val GeoPrior: 0.616803
+  [OK] Best model saved (val_prior=0.960239)
+Epoch [ 25/100]  Train Opt: 0.767114  Train Prior: 1.024948  Val Prior: 0.947142  Train Topo: 0.344140  Val Topo: 0.343792  Train GeoPrior: 0.680808  Val GeoPrior: 0.603351
+  [OK] Best model saved (val_prior=0.947142)
+Epoch [ 26/100]  Train Opt: 0.758525  Train Prior: 1.006029  Val Prior: 0.940853  Train Topo: 0.343691  Val Topo: 0.343563  Train GeoPrior: 0.662338  Val GeoPrior: 0.597290
+  [OK] Best model saved (val_prior=0.940853)
+Epoch [ 27/100]  Train Opt: 0.752481  Train Prior: 0.994639  Val Prior: 0.920361  Train Topo: 0.343696  Val Topo: 0.343466  Train GeoPrior: 0.650943  Val GeoPrior: 0.576895
+  [OK] Best model saved (val_prior=0.920361)
+Epoch [ 28/100]  Train Opt: 0.747161  Train Prior: 0.984683  Val Prior: 0.910285  Train Topo: 0.343670  Val Topo: 0.343472  Train GeoPrior: 0.641013  Val GeoPrior: 0.566814
+  [OK] Best model saved (val_prior=0.910285)
+Epoch [ 29/100]  Train Opt: 0.743282  Train Prior: 0.978485  Val Prior: 0.903493  Train Topo: 0.343701  Val Topo: 0.343472  Train GeoPrior: 0.634784  Val GeoPrior: 0.560021
+  [OK] Best model saved (val_prior=0.903493)
+Epoch [ 30/100]  Train Opt: 0.738376  Train Prior: 0.972568  Val Prior: 0.903676  Train Topo: 0.343396  Val Topo: 0.343377  Train GeoPrior: 0.629171  Val GeoPrior: 0.560300
+Epoch [ 31/100]  Train Opt: 0.734004  Train Prior: 0.963810  Val Prior: 0.892651  Train Topo: 0.343338  Val Topo: 0.343322  Train GeoPrior: 0.620472  Val GeoPrior: 0.549329
+  [OK] Best model saved (val_prior=0.892651)
+Epoch [ 32/100]  Train Opt: 0.730065  Train Prior: 0.956979  Val Prior: 0.915221  Train Topo: 0.343240  Val Topo: 0.343414  Train GeoPrior: 0.613739  Val GeoPrior: 0.571807
+Epoch [ 33/100]  Train Opt: 0.727572  Train Prior: 0.954726  Val Prior: 0.879336  Train Topo: 0.343302  Val Topo: 0.343249  Train GeoPrior: 0.611423  Val GeoPrior: 0.536087
+  [OK] Best model saved (val_prior=0.879336)
+Epoch [ 34/100]  Train Opt: 0.720748  Train Prior: 0.944722  Val Prior: 0.874745  Train Topo: 0.343279  Val Topo: 0.343266  Train GeoPrior: 0.601443  Val GeoPrior: 0.531479
+  [OK] Best model saved (val_prior=0.874745)
+Epoch [ 35/100]  Train Opt: 0.716198  Train Prior: 0.938562  Val Prior: 0.866778  Train Topo: 0.343035  Val Topo: 0.343136  Train GeoPrior: 0.595527  Val GeoPrior: 0.523643
+  [OK] Best model saved (val_prior=0.866778)
+Epoch [ 36/100]  Train Opt: 0.711240  Train Prior: 0.931660  Val Prior: 0.854827  Train Topo: 0.343181  Val Topo: 0.343148  Train GeoPrior: 0.588479  Val GeoPrior: 0.511679
+  [OK] Best model saved (val_prior=0.854827)
+Epoch [ 37/100]  Train Opt: 0.705805  Train Prior: 0.922901  Val Prior: 0.853018  Train Topo: 0.343090  Val Topo: 0.343100  Train GeoPrior: 0.579812  Val GeoPrior: 0.509918
+  [OK] Best model saved (val_prior=0.853018)
+Epoch [ 38/100]  Train Opt: 0.702283  Train Prior: 0.920704  Val Prior: 0.852375  Train Topo: 0.343198  Val Topo: 0.343242  Train GeoPrior: 0.577506  Val GeoPrior: 0.509133
+  [OK] Best model saved (val_prior=0.852375)
+Epoch [ 39/100]  Train Opt: 0.697513  Train Prior: 0.914691  Val Prior: 0.847395  Train Topo: 0.343073  Val Topo: 0.343295  Train GeoPrior: 0.571618  Val GeoPrior: 0.504100
+  [OK] Best model saved (val_prior=0.847395)
+Epoch [ 40/100]  Train Opt: 0.692416  Train Prior: 0.909529  Val Prior: 0.840674  Train Topo: 0.343106  Val Topo: 0.343312  Train GeoPrior: 0.566423  Val GeoPrior: 0.497363
+  [OK] Best model saved (val_prior=0.840674)
+Epoch [ 41/100]  Train Opt: 0.687140  Train Prior: 0.903801  Val Prior: 0.832535  Train Topo: 0.342972  Val Topo: 0.343123  Train GeoPrior: 0.560829  Val GeoPrior: 0.489413
+  [OK] Best model saved (val_prior=0.832535)
+Epoch [ 42/100]  Train Opt: 0.683722  Train Prior: 0.900959  Val Prior: 0.825972  Train Topo: 0.343057  Val Topo: 0.343252  Train GeoPrior: 0.557902  Val GeoPrior: 0.482720
+  [OK] Best model saved (val_prior=0.825972)
+Epoch [ 43/100]  Train Opt: 0.677824  Train Prior: 0.895095  Val Prior: 0.823616  Train Topo: 0.342941  Val Topo: 0.342956  Train GeoPrior: 0.552154  Val GeoPrior: 0.480660
+  [OK] Best model saved (val_prior=0.823616)
+Epoch [ 44/100]  Train Opt: 0.673071  Train Prior: 0.888456  Val Prior: 0.816281  Train Topo: 0.342850  Val Topo: 0.342903  Train GeoPrior: 0.545605  Val GeoPrior: 0.473378
+  [OK] Best model saved (val_prior=0.816281)
+Epoch [ 45/100]  Train Opt: 0.669232  Train Prior: 0.884884  Val Prior: 0.812834  Train Topo: 0.343065  Val Topo: 0.343068  Train GeoPrior: 0.541819  Val GeoPrior: 0.469765
+  [OK] Best model saved (val_prior=0.812834)
+Epoch [ 46/100]  Train Opt: 0.665506  Train Prior: 0.883552  Val Prior: 0.808570  Train Topo: 0.342989  Val Topo: 0.342880  Train GeoPrior: 0.540563  Val GeoPrior: 0.465690
+  [OK] Best model saved (val_prior=0.808570)
+Epoch [ 47/100]  Train Opt: 0.661347  Train Prior: 0.878431  Val Prior: 0.804975  Train Topo: 0.342919  Val Topo: 0.342920  Train GeoPrior: 0.535513  Val GeoPrior: 0.462055
+  [OK] Best model saved (val_prior=0.804975)
+Epoch [ 48/100]  Train Opt: 0.657210  Train Prior: 0.872605  Val Prior: 0.799246  Train Topo: 0.342885  Val Topo: 0.342960  Train GeoPrior: 0.529720  Val GeoPrior: 0.456287
+  [OK] Best model saved (val_prior=0.799246)
+Epoch [ 49/100]  Train Opt: 0.653500  Train Prior: 0.870371  Val Prior: 0.798187  Train Topo: 0.342838  Val Topo: 0.343108  Train GeoPrior: 0.527533  Val GeoPrior: 0.455078
+  [OK] Best model saved (val_prior=0.798187)
+Epoch [ 50/100]  Train Opt: 0.649901  Train Prior: 0.865601  Val Prior: 0.796588  Train Topo: 0.342709  Val Topo: 0.342979  Train GeoPrior: 0.522892  Val GeoPrior: 0.453609
+  [OK] Best model saved (val_prior=0.796588)
+Epoch [ 51/100]  Train Opt: 0.647534  Train Prior: 0.863781  Val Prior: 0.793318  Train Topo: 0.342820  Val Topo: 0.342859  Train GeoPrior: 0.520962  Val GeoPrior: 0.450459
+  [OK] Best model saved (val_prior=0.793318)
+Epoch [ 52/100]  Train Opt: 0.644132  Train Prior: 0.860012  Val Prior: 0.788166  Train Topo: 0.342821  Val Topo: 0.342866  Train GeoPrior: 0.517191  Val GeoPrior: 0.445300
+  [OK] Best model saved (val_prior=0.788166)
+Epoch [ 53/100]  Train Opt: 0.642246  Train Prior: 0.858438  Val Prior: 0.783151  Train Topo: 0.342730  Val Topo: 0.342856  Train GeoPrior: 0.515708  Val GeoPrior: 0.440295
+  [OK] Best model saved (val_prior=0.783151)
+Epoch [ 54/100]  Train Opt: 0.640074  Train Prior: 0.856182  Val Prior: 0.782485  Train Topo: 0.342710  Val Topo: 0.342810  Train GeoPrior: 0.513472  Val GeoPrior: 0.439675
+  [OK] Best model saved (val_prior=0.782485)
+Epoch [ 55/100]  Train Opt: 0.637356  Train Prior: 0.853374  Val Prior: 0.779234  Train Topo: 0.342674  Val Topo: 0.342823  Train GeoPrior: 0.510700  Val GeoPrior: 0.436411
+  [OK] Best model saved (val_prior=0.779234)
+Epoch [ 56/100]  Train Opt: 0.634532  Train Prior: 0.848671  Val Prior: 0.776295  Train Topo: 0.342687  Val Topo: 0.342844  Train GeoPrior: 0.505984  Val GeoPrior: 0.433451
+  [OK] Best model saved (val_prior=0.776295)
+Epoch [ 57/100]  Train Opt: 0.631524  Train Prior: 0.845081  Val Prior: 0.774447  Train Topo: 0.342763  Val Topo: 0.342859  Train GeoPrior: 0.502319  Val GeoPrior: 0.431588
+  [OK] Best model saved (val_prior=0.774447)
+Epoch [ 58/100]  Train Opt: 0.630069  Train Prior: 0.843997  Val Prior: 0.770571  Train Topo: 0.342607  Val Topo: 0.342801  Train GeoPrior: 0.501390  Val GeoPrior: 0.427770
+  [OK] Best model saved (val_prior=0.770571)
+Epoch [ 59/100]  Train Opt: 0.627830  Train Prior: 0.839918  Val Prior: 0.769086  Train Topo: 0.342555  Val Topo: 0.342832  Train GeoPrior: 0.497363  Val GeoPrior: 0.426254
+  [OK] Best model saved (val_prior=0.769086)
+Epoch [ 60/100]  Train Opt: 0.626653  Train Prior: 0.838738  Val Prior: 0.768518  Train Topo: 0.342648  Val Topo: 0.342901  Train GeoPrior: 0.496090  Val GeoPrior: 0.425617
+  [OK] Best model saved (val_prior=0.768518)
+Epoch [ 61/100]  Train Opt: 0.625116  Train Prior: 0.837865  Val Prior: 0.765258  Train Topo: 0.342550  Val Topo: 0.342815  Train GeoPrior: 0.495315  Val GeoPrior: 0.422443
+  [OK] Best model saved (val_prior=0.765258)
+Epoch [ 62/100]  Train Opt: 0.623502  Train Prior: 0.835570  Val Prior: 0.762247  Train Topo: 0.342468  Val Topo: 0.342814  Train GeoPrior: 0.493103  Val GeoPrior: 0.419433
+  [OK] Best model saved (val_prior=0.762247)
+Epoch [ 63/100]  Train Opt: 0.622550  Train Prior: 0.833721  Val Prior: 0.759682  Train Topo: 0.342606  Val Topo: 0.342822  Train GeoPrior: 0.491115  Val GeoPrior: 0.416859
+  [OK] Best model saved (val_prior=0.759682)
+Epoch [ 64/100]  Train Opt: 0.620882  Train Prior: 0.831952  Val Prior: 0.758839  Train Topo: 0.342629  Val Topo: 0.342725  Train GeoPrior: 0.489323  Val GeoPrior: 0.416114
+  [OK] Best model saved (val_prior=0.758839)
+Epoch [ 65/100]  Train Opt: 0.620092  Train Prior: 0.830816  Val Prior: 0.757468  Train Topo: 0.342530  Val Topo: 0.342744  Train GeoPrior: 0.488287  Val GeoPrior: 0.414724
+  [OK] Best model saved (val_prior=0.757468)
+Epoch [ 66/100]  Train Opt: 0.618975  Train Prior: 0.829858  Val Prior: 0.757252  Train Topo: 0.342446  Val Topo: 0.342803  Train GeoPrior: 0.487413  Val GeoPrior: 0.414449
+  [OK] Best model saved (val_prior=0.757252)
+Epoch [ 67/100]  Train Opt: 0.617147  Train Prior: 0.826163  Val Prior: 0.755240  Train Topo: 0.342379  Val Topo: 0.342789  Train GeoPrior: 0.483784  Val GeoPrior: 0.412452
+  [OK] Best model saved (val_prior=0.755240)
+Epoch [ 68/100]  Train Opt: 0.616385  Train Prior: 0.824747  Val Prior: 0.751574  Train Topo: 0.342450  Val Topo: 0.342759  Train GeoPrior: 0.482297  Val GeoPrior: 0.408814
+  [OK] Best model saved (val_prior=0.751574)
+Epoch [ 69/100]  Train Opt: 0.615835  Train Prior: 0.825665  Val Prior: 0.750745  Train Topo: 0.342632  Val Topo: 0.342749  Train GeoPrior: 0.483033  Val GeoPrior: 0.407996
+  [OK] Best model saved (val_prior=0.750745)
+Epoch [ 70/100]  Train Opt: 0.614662  Train Prior: 0.823034  Val Prior: 0.752136  Train Topo: 0.342414  Val Topo: 0.342723  Train GeoPrior: 0.480620  Val GeoPrior: 0.409413
+Epoch [ 71/100]  Train Opt: 0.613593  Train Prior: 0.821375  Val Prior: 0.749753  Train Topo: 0.342513  Val Topo: 0.342722  Train GeoPrior: 0.478862  Val GeoPrior: 0.407031
+  [OK] Best model saved (val_prior=0.749753)
+Epoch [ 72/100]  Train Opt: 0.612498  Train Prior: 0.819182  Val Prior: 0.749852  Train Topo: 0.342512  Val Topo: 0.342792  Train GeoPrior: 0.476670  Val GeoPrior: 0.407060
+Epoch [ 73/100]  Train Opt: 0.612443  Train Prior: 0.819006  Val Prior: 0.748983  Train Topo: 0.342535  Val Topo: 0.342736  Train GeoPrior: 0.476470  Val GeoPrior: 0.406247
+  [OK] Best model saved (val_prior=0.748983)
+Epoch [ 74/100]  Train Opt: 0.611498  Train Prior: 0.817854  Val Prior: 0.746860  Train Topo: 0.342263  Val Topo: 0.342750  Train GeoPrior: 0.475591  Val GeoPrior: 0.404110
+  [OK] Best model saved (val_prior=0.746860)
+Epoch [ 75/100]  Train Opt: 0.611088  Train Prior: 0.816943  Val Prior: 0.744460  Train Topo: 0.342348  Val Topo: 0.342724  Train GeoPrior: 0.474596  Val GeoPrior: 0.401735
+  [OK] Best model saved (val_prior=0.744460)
+Epoch [ 76/100]  Train Opt: 0.610479  Train Prior: 0.816403  Val Prior: 0.743591  Train Topo: 0.342396  Val Topo: 0.342708  Train GeoPrior: 0.474007  Val GeoPrior: 0.400883
+  [OK] Best model saved (val_prior=0.743591)
+Epoch [ 77/100]  Train Opt: 0.610276  Train Prior: 0.816158  Val Prior: 0.744194  Train Topo: 0.342478  Val Topo: 0.342733  Train GeoPrior: 0.473680  Val GeoPrior: 0.401461
+Epoch [ 78/100]  Train Opt: 0.609301  Train Prior: 0.814498  Val Prior: 0.744809  Train Topo: 0.342262  Val Topo: 0.342739  Train GeoPrior: 0.472235  Val GeoPrior: 0.402071
+Epoch [ 79/100]  Train Opt: 0.608594  Train Prior: 0.813043  Val Prior: 0.742173  Train Topo: 0.342456  Val Topo: 0.342742  Train GeoPrior: 0.470587  Val GeoPrior: 0.399431
+  [OK] Best model saved (val_prior=0.742173)
+Epoch [ 80/100]  Train Opt: 0.608186  Train Prior: 0.812143  Val Prior: 0.741399  Train Topo: 0.342461  Val Topo: 0.342705  Train GeoPrior: 0.469682  Val GeoPrior: 0.398694
+  [OK] Best model saved (val_prior=0.741399)
+Epoch [ 81/100]  Train Opt: 0.607663  Train Prior: 0.811523  Val Prior: 0.740945  Train Topo: 0.342357  Val Topo: 0.342727  Train GeoPrior: 0.469166  Val GeoPrior: 0.398218
+  [OK] Best model saved (val_prior=0.740945)
+Epoch [ 82/100]  Train Opt: 0.607508  Train Prior: 0.811107  Val Prior: 0.740798  Train Topo: 0.342459  Val Topo: 0.342726  Train GeoPrior: 0.468649  Val GeoPrior: 0.398072
+  [OK] Best model saved (val_prior=0.740798)
+Epoch [ 83/100]  Train Opt: 0.608135  Train Prior: 0.812204  Val Prior: 0.741133  Train Topo: 0.342554  Val Topo: 0.342707  Train GeoPrior: 0.469650  Val GeoPrior: 0.398426
+Epoch [ 84/100]  Train Opt: 0.607792  Train Prior: 0.812228  Val Prior: 0.739413  Train Topo: 0.342418  Val Topo: 0.342711  Train GeoPrior: 0.469810  Val GeoPrior: 0.396703
+  [OK] Best model saved (val_prior=0.739413)
+Epoch [ 85/100]  Train Opt: 0.606603  Train Prior: 0.809702  Val Prior: 0.739909  Train Topo: 0.342462  Val Topo: 0.342705  Train GeoPrior: 0.467240  Val GeoPrior: 0.397203
+Epoch [ 86/100]  Train Opt: 0.606960  Train Prior: 0.810715  Val Prior: 0.739689  Train Topo: 0.342368  Val Topo: 0.342723  Train GeoPrior: 0.468348  Val GeoPrior: 0.396966
+Epoch [ 87/100]  Train Opt: 0.606768  Train Prior: 0.809495  Val Prior: 0.738810  Train Topo: 0.342587  Val Topo: 0.342734  Train GeoPrior: 0.466908  Val GeoPrior: 0.396076
+  [OK] Best model saved (val_prior=0.738810)
+Epoch [ 88/100]  Train Opt: 0.606727  Train Prior: 0.809846  Val Prior: 0.738600  Train Topo: 0.342438  Val Topo: 0.342722  Train GeoPrior: 0.467408  Val GeoPrior: 0.395877
+  [OK] Best model saved (val_prior=0.738600)
+Epoch [ 89/100]  Train Opt: 0.606610  Train Prior: 0.809278  Val Prior: 0.739142  Train Topo: 0.342378  Val Topo: 0.342701  Train GeoPrior: 0.466899  Val GeoPrior: 0.396442
+Epoch [ 90/100]  Train Opt: 0.605498  Train Prior: 0.807236  Val Prior: 0.738584  Train Topo: 0.342387  Val Topo: 0.342708  Train GeoPrior: 0.464849  Val GeoPrior: 0.395876
+  [OK] Best model saved (val_prior=0.738584)
+Epoch [ 91/100]  Train Opt: 0.606006  Train Prior: 0.808871  Val Prior: 0.738141  Train Topo: 0.342472  Val Topo: 0.342716  Train GeoPrior: 0.466399  Val GeoPrior: 0.395425
+  [OK] Best model saved (val_prior=0.738141)
+Epoch [ 92/100]  Train Opt: 0.605999  Train Prior: 0.808479  Val Prior: 0.737814  Train Topo: 0.342360  Val Topo: 0.342708  Train GeoPrior: 0.466120  Val GeoPrior: 0.395106
+  [OK] Best model saved (val_prior=0.737814)
+Epoch [ 93/100]  Train Opt: 0.606233  Train Prior: 0.809283  Val Prior: 0.738011  Train Topo: 0.342428  Val Topo: 0.342714  Train GeoPrior: 0.466855  Val GeoPrior: 0.395297
+Epoch [ 94/100]  Train Opt: 0.605151  Train Prior: 0.806791  Val Prior: 0.738026  Train Topo: 0.342499  Val Topo: 0.342707  Train GeoPrior: 0.464292  Val GeoPrior: 0.395318
+Epoch [ 95/100]  Train Opt: 0.605959  Train Prior: 0.808823  Val Prior: 0.737600  Train Topo: 0.342410  Val Topo: 0.342711  Train GeoPrior: 0.466412  Val GeoPrior: 0.394889
+  [OK] Best model saved (val_prior=0.737600)
+Epoch [ 96/100]  Train Opt: 0.606263  Train Prior: 0.809049  Val Prior: 0.737826  Train Topo: 0.342541  Val Topo: 0.342707  Train GeoPrior: 0.466508  Val GeoPrior: 0.395119
+Epoch [ 97/100]  Train Opt: 0.605983  Train Prior: 0.808991  Val Prior: 0.737680  Train Topo: 0.342536  Val Topo: 0.342707  Train GeoPrior: 0.466455  Val GeoPrior: 0.394973
+Epoch [ 98/100]  Train Opt: 0.606161  Train Prior: 0.809094  Val Prior: 0.737827  Train Topo: 0.342323  Val Topo: 0.342707  Train GeoPrior: 0.466771  Val GeoPrior: 0.395120
+Epoch [ 99/100]  Train Opt: 0.605792  Train Prior: 0.808684  Val Prior: 0.737748  Train Topo: 0.342505  Val Topo: 0.342708  Train GeoPrior: 0.466179  Val GeoPrior: 0.395040
+Epoch [100/100]  Train Opt: 0.605407  Train Prior: 0.808144  Val Prior: 0.737719  Train Topo: 0.342353  Val Topo: 0.342708  Train GeoPrior: 0.465792  Val GeoPrior: 0.395011
+[*] Final test metrics: total=0.530365  prior=0.723164  topo=0.340078  geo_prior=0.383087
+[OK] Done. Loss curve saved to 'F:\LINKS4Meta\GraphMetaMat-LINKS\artifacts\il_hparam_scan\beta_1p0__prior_0p25\il_loss_curve.png'
+[OK] Best weights saved to 'F:\LINKS4Meta\GraphMetaMat-LINKS\artifacts\il_hparam_scan\beta_1p0__prior_0p25\model_inverse_il.pt'
+[OK] Report saved to 'F:\LINKS4Meta\GraphMetaMat-LINKS\artifacts\il_hparam_scan\beta_1p0__prior_0p25\il_training_report.json'
