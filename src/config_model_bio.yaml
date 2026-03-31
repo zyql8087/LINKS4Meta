@@ -1,0 +1,25 @@
+# src/config_model_bio.yaml
+
+encoder:
+  type: "transformer"  # 使用 TransformerConv 处理复杂拓扑
+  hidden_dim: 128      # 增加维度
+  num_layers: 4        # 增加深度 (原代码为 2)
+  num_heads: 4
+  dropout: 0.1
+  use_edge_attr: True  # 关键：必须开启，因为杆长是核心信息
+
+decoder:
+  # 用于 MLP 的配置
+  hidden_dim: 128
+  num_layers: 4
+
+training:
+  batch_size: 4096
+  learning_rate: 0.0005
+  curve_steps: 200
+  epochs: 200
+  
+  # Loss 权重
+  w_foot: 1.0
+  w_knee: 0.5
+  w_ankle: 0.5
