@@ -1,0 +1,48 @@
+curve_encoder:
+  input_dim: 800
+  hidden_dims: [512, 256]
+  latent_dim: 128
+
+gnn_policy:
+  node_input_dim: 4
+  edge_input_dim: 1
+  hidden_dim: 128
+  num_layers: 4
+  dropout: 0.1
+  num_families: 4
+  family_embedding_dim: 8
+  step_embedding_dim: 8
+  context_hidden_dim: 128
+  max_step_count: 2
+
+links_pretrain:
+  enabled: true
+  auto_run_if_missing: false
+  source_variant: "curated"
+  batch_size: 512
+  learning_rate: 0.0003
+  epochs: 12
+  patience: 4
+  temperature: 0.07
+  contrastive_weight: 1.0
+  forward_weight: 0.5
+  validity_weight: 0.5
+  projection_dim: 128
+  max_samples: 20000
+  seed: 42
+  tasks:
+    encoder_pretrain: true
+    forward_pretrain: true
+    validity_pretrain: true
+
+constraints:
+  min_link_length: 0.05
+  min_node_distance: 0.01
+  intersection_eps: 1.0e-8
+
+paths:
+  precomputed_split_input: "../../LINKS-main/output/data_gen_v2_final80k_20260331/split_indices_v2.json"
+  links_pretrain_input: "../../LINKS-main/output/data_gen_v2_final80k_20260331/diverse_dataset_v2.pkl"
+  links_pretrain_cache_output: "../../demo/outputs/pretrain/links_pretrain_cache.pt"
+  links_pretrain_model_output: "../../demo/outputs/checkpoints/graphmetamat_links/model_inverse_links_pretrain.pt"
+  links_pretrain_report_output: "../../demo/outputs/reports/links_pretrain_report.json"

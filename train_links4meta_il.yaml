@@ -1,0 +1,104 @@
+curve_encoder:
+  input_dim: 800
+  hidden_dims: [512, 256]
+  latent_dim: 128
+
+gnn_policy:
+  node_input_dim: 4
+  edge_input_dim: 1
+  hidden_dim: 128
+  num_layers: 4
+  dropout: 0.1
+  num_families: 4
+  family_embedding_dim: 8
+  step_embedding_dim: 8
+  context_hidden_dim: 128
+  max_step_count: 2
+
+cvae:
+  latent_dim: 64
+  condition_dim: 128
+  output_dim: 4
+  beta: 1.0
+  prior_bias_init: 0.10
+  prior_bias_max: 0.50
+
+il_training:
+  batch_size: 4096
+  learning_rate: 0.0003
+  epochs: 100
+  w_topology: 1.0
+  w_geometry: 1.0
+  w_geometry_prior: 0.75
+  w_geometry_prior_regularizer: 0.10
+  w_action: 1.0
+  w_stop: 1.0
+  w_step_role: 0.5
+  w_step_count: 0.5
+  geometry_prior_margin_scale: 1.25
+  val_ratio: 0.1
+  test_ratio: 0.1
+  split_seed: 42
+  patience: 20
+  max_reconstruction_traces: 256
+  predict_stop: false
+  curriculum_stages:
+    - name: stage_a_single_step
+      families: ["6bar", "7bar"]
+      epochs: 40
+      patience: 10
+    - name: stage_b_two_step
+      families: ["8bar", "9bar"]
+      epochs: 40
+      patience: 10
+    - name: stage_c_family_conditioned
+      families: ["6bar", "7bar", "8bar", "9bar"]
+      epochs: 60
+      patience: 15
+
+links_pretrain:
+  enabled: true
+  auto_run_if_missing: false
+  source_variant: "curated"
+  batch_size: 512
+  learning_rate: 0.0003
+  epochs: 12
+  patience: 4
+  temperature: 0.07
+  contrastive_weight: 1.0
+  forward_weight: 0.5
+  validity_weight: 0.5
+  projection_dim: 128
+  max_samples: 20000
+  seed: 42
+  tasks:
+    encoder_pretrain: true
+    forward_pretrain: true
+    validity_pretrain: true
+
+family_index:
+  build_on_train: true
+  export_jsonl: true
+
+constraints:
+  min_link_length: 0.05
+  min_node_distance: 0.01
+  intersection_eps: 1.0e-8
+
+paths:
+  pkl_dataset: "../../LINKS-main/output/data_gen_v2_final80k_20260331/diverse_dataset_v2.pkl"
+  precomputed_split_input: "../../LINKS-main/output/data_gen_v2_final80k_20260331/split_indices_v2.json"
+  links_pretrain_input: "../../LINKS-main/output/data_gen_v2_final80k_20260331/diverse_dataset_v2.pkl"
+  links_pretrain_cache_output: "../../demo/outputs/pretrain/links_pretrain_cache.pt"
+  links_pretrain_model_output: "../../demo/outputs/checkpoints/graphmetamat_links/model_inverse_links_pretrain.pt"
+  links_pretrain_report_output: "../../demo/outputs/reports/links_pretrain_report.json"
+  forward_model: "../../demo/outputs/checkpoints/graphmetamat_links/model_bio_best.pt"
+  config_forward: "config_model_bio.yaml"
+  il_dataset_output: "../../LINKS-main/output/data_gen_v2_final80k_20260331/il_expert_paths_multibase_80k.pt"
+  il_multistep_dataset_output: "../../LINKS-main/output/data_gen_v2_final80k_20260331/il_expert_paths_multistep_multibase_80k.pt"
+  il_model_output: "../../demo/outputs/checkpoints/graphmetamat_links/model_inverse_il.pt"
+  il_plot_output: "../../demo/outputs/reports/il_loss_curve_phase4_multistep_80k.png"
+  il_report_output: "../../demo/outputs/reports/il_training_report_phase4_multistep_80k.json"
+  il_split_output: "../../demo/outputs/reports/il_split_indices_phase4_multistep_80k.pt"
+  family_index_output_dir: "../../demo/outputs/family_index"
+  rl_model_output: "../../demo/outputs/checkpoints/graphmetamat_links/model_inverse_rl.pt"

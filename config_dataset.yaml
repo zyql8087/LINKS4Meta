@@ -1,0 +1,17 @@
+# src/config_dataset.yaml
+# Dataset 80k Configuration
+
+# 数据集路径
+dataset_path: "../../LINKS-main/output/data_gen_v2_final80k_20260331/diverse_dataset_v2_with_curves.pt"
+split_indices_path: "../../LINKS-main/output/data_gen_v2_final80k_20260331/split_indices_v2.json"
+
+# 数据分割比例
+train_ratio: 0.8
+val_ratio: 0.1
+test_ratio: 0.1
+
+# 随机种子
+seed: 42
+
+# 数据预处理
+normalize: true

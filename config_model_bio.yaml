@@ -1,0 +1,34 @@
+# src/config_model_bio.yaml
+
+encoder:
+  type: "transformer"
+  hidden_dim: 128
+  node_input_dim: 8
+  num_layers: 4
+  num_heads: 4
+  dropout: 0.1
+  use_edge_attr: true
+
+decoder:
+  hidden_dim: 128
+  num_layers: 4
+  num_families: 4
+  family_embedding_dim: 16
+  step_context_input_dim: 3
+  step_context_hidden_dim: 16
+
+training:
+  batch_size: 4096
+  learning_rate: 0.0005
+  curve_steps: 200
+  epochs: 200
+  w_foot: 1.0
+  w_knee: 0.5
+  w_ankle: 0.5
+
+evaluation:
+  batch_size: 512
+  primary_foot_metric: "foot_path_error"
+  max_family_metric_ratio: 1.8
+  max_89_multiplier: 1.8
+  max_semantic_ablation_ratio: 3.0
