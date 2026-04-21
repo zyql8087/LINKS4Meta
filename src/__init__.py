@@ -1,2 +1,2 @@
-# src/__init__.py
-# Make src a Python package
+# src/generative_curve/__init__.py
+# Make generative_curve a Python package
