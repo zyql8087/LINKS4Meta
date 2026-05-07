@@ -28,13 +28,13 @@ from src.forward_dataset_utils import sample_to_pyg_data
 DEFAULT_INPUT_PKL = Path(
     os.environ.get(
         'LINKS_PKL_PATH',
-        WORKSPACE_ROOT / 'LINKS-main' / 'output' / 'data_gen_v2_final80k_20260331' / 'diverse_dataset_v2.pkl',
+        WORKSPACE_ROOT.parent / 'LINKS-main' / 'output' / 'data_gen_v2_final80k_20260331' / 'diverse_dataset_v2.pkl',
     )
 )
 DEFAULT_OUTPUT_PT = Path(
     os.environ.get(
         'LINKS_CURVE_PT_PATH',
-        WORKSPACE_ROOT / 'LINKS-main' / 'output' / 'data_gen_v2_final80k_20260331' / 'diverse_dataset_v2_with_curves.pt',
+        WORKSPACE_ROOT.parent / 'LINKS-main' / 'output' / 'data_gen_v2_final80k_20260331' / 'diverse_dataset_v2_with_curves.pt',
     )
 )
 DEFAULT_VIS_DIR = Path(
@@ -46,7 +46,7 @@ def _require_torch_for_convert() -> None:
     if torch is None or Data is None:
         print(f'[ERROR] PyTorch/PyG import failed: {TORCH_IMPORT_ERROR}')
         print('[HINT] Use GMM environment, e.g. from workspace root:')
-        print('       run_gmm.cmd GraphMetaMat-LINKS\\dataset_tool.py convert')
+        print('       run_gmm.cmd GraphMetaMat-LINKS\\code\\dataset_tool.py convert')
         sys.exit(1)
 
 

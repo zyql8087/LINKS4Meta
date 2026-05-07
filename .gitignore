@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+demo/outputs/
+*.pt
+*.pth
+*.ckpt
+*.png
+*.log
+
+.idea/
+.vscode/

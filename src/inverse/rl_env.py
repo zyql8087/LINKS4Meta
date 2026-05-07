@@ -15,11 +15,89 @@ from typing import Optional
 from torch_geometric.data import Data, Batch
 
 from src.inverse.experiment_utils import compute_joint_metrics_batch, compute_reward_batch
+from src.inverse.readout_assignment import RuleBasedReadoutAssignment, assignment_to_masks
+
+
+_DEFAULT_READOUT_ASSIGNER = RuleBasedReadoutAssignment(top_k=3)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 前向代理模型加载（冻结）
 # ──────────────────────────────────────────────────────────────────────────────
+def _extract_model_state_dict(checkpoint) -> dict:
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        return checkpoint["model_state_dict"]
+    if isinstance(checkpoint, dict):
+        return checkpoint
+    raise TypeError(f"Unsupported forward checkpoint type: {type(checkpoint)!r}")
+
+
+def inspect_forward_checkpoint_compatibility(checkpoint_state: dict, cfg: dict) -> dict:
+    encoder_cfg = dict(cfg.get("encoder", {}))
+    decoder_cfg = dict(cfg.get("decoder", {}))
+
+    expected_node_input_dim = int(encoder_cfg.get("node_input_dim", 4))
+    expected_hidden_dim = int(encoder_cfg.get("hidden_dim", decoder_cfg.get("hidden_dim", 128)))
+    expected_family_embedding_dim = int(decoder_cfg.get("family_embedding_dim", 0))
+    expected_step_context_hidden_dim = int(decoder_cfg.get("step_context_hidden_dim", 0))
+    expected_decoder_input_dim = (
+        expected_hidden_dim + expected_family_embedding_dim + expected_step_context_hidden_dim
+    )
+
+    node_weight = checkpoint_state.get("encoder.pre_mlp_nodes.weight")
+    decoder_weight = checkpoint_state.get("decoder_foot.linear_li.0.weight")
+    actual_node_input_dim = (
+        int(node_weight.size(1))
+        if isinstance(node_weight, torch.Tensor) and node_weight.dim() == 2
+        else None
+    )
+    actual_decoder_input_dim = (
+        int(decoder_weight.size(1))
+        if isinstance(decoder_weight, torch.Tensor) and decoder_weight.dim() == 2
+        else None
+    )
+    has_family_embedding = "family_embedding.weight" in checkpoint_state
+    has_step_context_encoder = any(
+        str(key).startswith("step_context_encoder.") for key in checkpoint_state.keys()
+    )
+
+    issues = []
+    if actual_node_input_dim != expected_node_input_dim:
+        issues.append(
+            f"node_input_dim mismatch: checkpoint={actual_node_input_dim}, config={expected_node_input_dim}"
+        )
+    if expected_family_embedding_dim > 0 and not has_family_embedding:
+        issues.append("checkpoint is missing decoder family_embedding weights")
+    if expected_step_context_hidden_dim > 0 and not has_step_context_encoder:
+        issues.append("checkpoint is missing decoder step_context_encoder weights")
+    if actual_decoder_input_dim != expected_decoder_input_dim:
+        issues.append(
+            f"decoder input mismatch: checkpoint={actual_decoder_input_dim}, config={expected_decoder_input_dim}"
+        )
+
+    if actual_node_input_dim == 4 and not has_family_embedding and not has_step_context_encoder:
+        checkpoint_variant = "legacy_4d_no_context"
+    elif (
+        actual_node_input_dim == expected_node_input_dim
+        and has_family_embedding == (expected_family_embedding_dim > 0)
+        and has_step_context_encoder == (expected_step_context_hidden_dim > 0)
+    ):
+        checkpoint_variant = "semantic_context"
+    else:
+        checkpoint_variant = "mixed_or_unknown"
+
+    return {
+        "checkpoint_variant": checkpoint_variant,
+        "expected_node_input_dim": expected_node_input_dim,
+        "actual_node_input_dim": actual_node_input_dim,
+        "expected_decoder_input_dim": expected_decoder_input_dim,
+        "actual_decoder_input_dim": actual_decoder_input_dim,
+        "has_family_embedding": bool(has_family_embedding),
+        "has_step_context_encoder": bool(has_step_context_encoder),
+        "issues": issues,
+    }
+
+
 def load_frozen_surrogate(model_path: str, config_path: str, device):
     """加载并冻结前向 BioKinematicsGNN 作为 Reward 计算器"""
     from src.generative_curve.GNN_model_biokinematics import BioKinematicsGNN
@@ -27,10 +105,24 @@ def load_frozen_surrogate(model_path: str, config_path: str, device):
         cfg = yaml.safe_load(f)
     model = BioKinematicsGNN(cfg).to(device)
     ckpt = torch.load(model_path, map_location=device, weights_only=False)
-    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'])
-    else:
-        model.load_state_dict(ckpt)
+    state_dict = _extract_model_state_dict(ckpt)
+    compatibility = inspect_forward_checkpoint_compatibility(state_dict, cfg)
+    if compatibility["issues"]:
+        issue_text = "; ".join(str(item) for item in compatibility["issues"])
+        raise RuntimeError(
+            f"Forward checkpoint/config mismatch for '{model_path}'. "
+            f"variant={compatibility['checkpoint_variant']}, "
+            f"issues={issue_text}. "
+            f"Use a checkpoint exported with the current 8-dim semantic/context forward config "
+            f"or retrain the forward model for '{config_path}'."
+        )
+    try:
+        model.load_state_dict(state_dict)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load forward checkpoint '{model_path}' even though the high-level shape signature looked compatible: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -47,6 +139,18 @@ def _to_numpy(x):
     return np.asarray(x)
 
 
+def _flag_is_true(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, torch.Tensor):
+        return bool(value.detach().view(-1)[0].item())
+    return bool(value)
+
+
 def _build_phase3_step_context(step_index: int, expected_j_steps: int) -> torch.Tensor:
     semantic_steps = 1 if int(step_index) >= int(expected_j_steps) else 0
     aux_steps = max(0, int(step_index) - semantic_steps)
@@ -56,46 +160,81 @@ def _build_phase3_step_context(step_index: int, expected_j_steps: int) -> torch.
     )
 
 
-def _infer_semantic_masks(graph_data: Data) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def _infer_semantic_masks(
+    graph_data: Data,
+    *,
+    target: Optional[dict] = None,
+    motion=None,
+    allow_assignment_fallback: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_nodes = int(graph_data.x.size(0))
     device = graph_data.x.device
+    semantic_dirty = _flag_is_true(getattr(graph_data, "semantic_dirty", None))
     mask_hip = torch.zeros(num_nodes, dtype=torch.bool, device=device)
     mask_knee = torch.zeros(num_nodes, dtype=torch.bool, device=device)
     mask_ankle = torch.zeros(num_nodes, dtype=torch.bool, device=device)
     mask_foot = torch.zeros(num_nodes, dtype=torch.bool, device=device)
 
-    if graph_data.x.size(-1) >= 8:
-        semantic = graph_data.x[:, -4:]
-        return (
-            semantic[:, 0] > 0.5,
-            semantic[:, 1] > 0.5,
-            semantic[:, 2] > 0.5,
-            semantic[:, 3] > 0.5,
-        )
+    if not semantic_dirty:
+        cached_masks = {
+            "hip": getattr(graph_data, "mask_hip", None),
+            "knee": getattr(graph_data, "mask_knee", None),
+            "ankle": getattr(graph_data, "mask_ankle", None),
+            "foot": getattr(graph_data, "mask_foot", None),
+        }
+        if any(mask is not None for mask in cached_masks.values()):
+            if cached_masks["hip"] is not None:
+                mask_hip = cached_masks["hip"].to(device=device, dtype=torch.bool).view(-1)[:num_nodes]
+            if cached_masks["knee"] is not None:
+                mask_knee = cached_masks["knee"].to(device=device, dtype=torch.bool).view(-1)[:num_nodes]
+            if cached_masks["ankle"] is not None:
+                mask_ankle = cached_masks["ankle"].to(device=device, dtype=torch.bool).view(-1)[:num_nodes]
+            if cached_masks["foot"] is not None:
+                mask_foot = cached_masks["foot"].to(device=device, dtype=torch.bool).view(-1)[:num_nodes]
+            if mask_knee.any() and mask_ankle.any() and mask_foot.any():
+                return mask_hip, mask_knee, mask_ankle, mask_foot
 
-    keypoints = getattr(graph_data, "keypoints", None)
-    if keypoints is not None:
-        keypoints = keypoints.view(-1).long()
-        if keypoints.numel() >= 3:
-            foot_idx = int(keypoints[0].item())
-            knee_idx = int(keypoints[1].item())
-            ankle_idx = int(keypoints[2].item())
+        if _flag_is_true(getattr(graph_data, "semantic_feature_layout", None)) and graph_data.x.size(-1) >= 8:
+            semantic = graph_data.x[:, -4:]
+            return (
+                semantic[:, 0] > 0.5,
+                semantic[:, 1] > 0.5,
+                semantic[:, 2] > 0.5,
+                semantic[:, 3] > 0.5,
+            )
+
+        keypoints = getattr(graph_data, "keypoints", None)
+        if keypoints is not None:
+            keypoints = keypoints.view(-1).long()
+            if keypoints.numel() >= 3:
+                foot_idx = int(keypoints[0].item())
+                knee_idx = int(keypoints[1].item())
+                ankle_idx = int(keypoints[2].item())
+                if 0 <= knee_idx < num_nodes:
+                    mask_knee[knee_idx] = True
+                if 0 <= ankle_idx < num_nodes:
+                    mask_ankle[ankle_idx] = True
+                if 0 <= foot_idx < num_nodes:
+                    mask_foot[foot_idx] = True
+
+        if not mask_knee.any() and hasattr(graph_data, "knee_idx") and graph_data.knee_idx is not None:
+            knee_idx = int(graph_data.knee_idx.view(-1)[0].item())
             if 0 <= knee_idx < num_nodes:
                 mask_knee[knee_idx] = True
-            if 0 <= ankle_idx < num_nodes:
-                mask_ankle[ankle_idx] = True
-            if 0 <= foot_idx < num_nodes:
-                mask_foot[foot_idx] = True
 
-    if not mask_knee.any() and hasattr(graph_data, "knee_idx") and graph_data.knee_idx is not None:
-        knee_idx = int(graph_data.knee_idx.view(-1)[0].item())
-        if 0 <= knee_idx < num_nodes:
-            mask_knee[knee_idx] = True
+    if allow_assignment_fallback and (not mask_knee.any() or not mask_ankle.any() or not mask_foot.any()):
+        assignment = _DEFAULT_READOUT_ASSIGNER.assign(graph_data, target=target, motion=motion)
+        if assignment is not None:
+            inferred = assignment_to_masks(assignment, num_nodes, device=device)
+            if not mask_hip.any():
+                mask_hip |= inferred["hip"]
+            if not mask_knee.any():
+                mask_knee |= inferred["knee"]
+            if not mask_ankle.any():
+                mask_ankle |= inferred["ankle"]
+            if not mask_foot.any():
+                mask_foot |= inferred["foot"]
 
-    if not mask_ankle.any() and num_nodes >= 2:
-        mask_ankle[num_nodes - 2] = True
-    if not mask_foot.any() and num_nodes >= 1:
-        mask_foot[num_nodes - 1] = True
     return mask_hip, mask_knee, mask_ankle, mask_foot
 
 
@@ -105,30 +244,38 @@ def _prepare_graph_for_surrogate(
     family_index: int,
     step_index: int,
     expected_j_steps: int,
+    target: Optional[dict] = None,
+    motion=None,
 ) -> Data:
     prepared = copy.deepcopy(graph_data)
     x = prepared.x.float()
     if x.size(-1) < 4:
         raise ValueError(f"Expected at least 4 node features, got {x.size(-1)}")
-    if x.size(-1) >= 8:
-        x_aug = x
-    else:
-        mask_hip, mask_knee, mask_ankle, mask_foot = _infer_semantic_masks(prepared)
-        semantic = torch.stack(
-            [
-                mask_hip.float(),
-                mask_knee.float(),
-                mask_ankle.float(),
-                mask_foot.float(),
-            ],
-            dim=-1,
-        )
-        x_aug = torch.cat([x[:, :4], semantic], dim=-1)
+    mask_hip, mask_knee, mask_ankle, mask_foot = _infer_semantic_masks(
+        prepared,
+        target=target,
+        motion=motion,
+    )
+    semantic = torch.stack(
+        [
+            mask_hip.float(),
+            mask_knee.float(),
+            mask_ankle.float(),
+            mask_foot.float(),
+        ],
+        dim=-1,
+    )
+    x_aug = torch.cat([x[:, :4], semantic], dim=-1)
+    prepared.semantic_feature_layout = torch.tensor([1], dtype=torch.long)
+    prepared.semantic_dirty = torch.tensor([False], dtype=torch.bool)
 
     prepared.x = x_aug
     prepared.family_id = torch.tensor([int(family_index)], dtype=torch.long)
     prepared.step_context = _build_phase3_step_context(step_index, expected_j_steps)
-    prepared.mask_hip, prepared.mask_knee, prepared.mask_ankle, prepared.mask_foot = _infer_semantic_masks(prepared)
+    prepared.mask_hip = mask_hip
+    prepared.mask_knee = mask_knee
+    prepared.mask_ankle = mask_ankle
+    prepared.mask_foot = mask_foot
     return prepared
 
 
@@ -233,7 +380,14 @@ def compute_reward(surrogate, graph_data: Data, target: dict,
         return reward_cfg.get('penalty_locking', -100.0), False, valid_info
 
     try:
-        batch = Batch.from_data_list([graph_data]).to(device)
+        prepared_graph = _prepare_graph_for_surrogate(
+            graph_data,
+            family_index=-1,
+            step_index=0,
+            expected_j_steps=1,
+            target=target,
+        )
+        batch = Batch.from_data_list([prepared_graph]).to(device)
         with torch.no_grad():
             pred_foot, pred_knee, pred_ankle = surrogate(batch)
         pred_foot  = pred_foot.squeeze(0).cpu()
@@ -285,6 +439,40 @@ def batch_compute_rewards(surrogate, graphs: list, target: dict,
             valid_graphs.append(graph)
 
     if not valid_graphs:
+        return results
+
+    prepared_graphs = [
+        _prepare_graph_for_surrogate(
+            graph,
+            family_index=-1,
+            step_index=0,
+            expected_j_steps=1,
+            target=target,
+        )
+        for graph in valid_graphs
+    ]
+
+    try:
+        batch = Batch.from_data_list(prepared_graphs).to(device)
+        with torch.no_grad():
+            pred_foot, pred_knee, pred_ankle = surrogate(batch)
+        reward_t, _ = compute_reward_batch(
+            pred_foot.cpu(), pred_knee.cpu(), pred_ankle.cpu(), target, reward_cfg
+        )
+        for batch_idx, graph_idx in enumerate(valid_indices):
+            results[graph_idx] = (float(reward_t[batch_idx].item()), True)
+        return results
+    except Exception:
+        for idx, prepared_graph in zip(valid_indices, prepared_graphs):
+            reward, valid, _ = compute_reward(
+                surrogate,
+                prepared_graph,
+                target,
+                reward_cfg,
+                device,
+                constraint_cfg=constraint_cfg,
+            )
+            results[idx] = (reward if valid else penalty, valid)
         return results
 
 
@@ -350,6 +538,7 @@ def batch_compute_phase5_rewards(
                 family_index=family_index,
                 step_index=int(step_indices[graph_idx]),
                 expected_j_steps=int(expected_j_steps),
+                target=target,
             )
             for graph, graph_idx in zip(valid_graphs, valid_graph_indices)
         ]
@@ -402,25 +591,6 @@ def batch_compute_phase5_rewards(
 
     return list(zip(base_rewards, valid_flags)), metric_payloads
 
-    try:
-        batch = Batch.from_data_list(valid_graphs).to(device)
-        with torch.no_grad():
-            pred_foot, pred_knee, pred_ankle = surrogate(batch)
-        reward_t, _ = compute_reward_batch(
-            pred_foot.cpu(), pred_knee.cpu(), pred_ankle.cpu(), target, reward_cfg
-        )
-        for batch_idx, graph_idx in enumerate(valid_indices):
-            results[graph_idx] = (float(reward_t[batch_idx].item()), True)
-        return results
-    except Exception:
-        # Fallback: per-graph evaluation
-        for idx, g in zip(valid_indices, valid_graphs):
-            reward, valid, _ = compute_reward(
-                surrogate, g, target, reward_cfg, device, constraint_cfg=constraint_cfg
-            )
-            results[idx] = (reward if valid else penalty, valid)
-        return results
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # J-Operator：将新 Dyad 嵌入当前图
@@ -440,19 +610,22 @@ def apply_j_operator(graph_data: Data, u: int, v: int, w: int,
       - n2 连接 n1 和固定节点 w
       返回包含 n1, n2 的新图 Data
     """
-    old_x   = graph_data.x.numpy()
-    old_pos = graph_data.pos.numpy()
+    old_x   = graph_data.x.detach().cpu().numpy()
+    old_pos = graph_data.pos.detach().cpu().numpy()
     N = old_x.shape[0]
+    feat_dim = old_x.shape[1]
 
-    n1_feat = np.array([[n1_pos[0], n1_pos[1], 0.0, 0.0]], dtype=np.float32)
-    n2_feat = np.array([[n2_pos[0], n2_pos[1], 0.0, 0.0]], dtype=np.float32)
+    n1_feat = np.zeros((1, feat_dim), dtype=np.float32)
+    n2_feat = np.zeros((1, feat_dim), dtype=np.float32)
+    n1_feat[0, :2] = n1_pos[:2]
+    n2_feat[0, :2] = n2_pos[:2]
 
     new_x   = np.vstack([old_x, n1_feat, n2_feat])
     new_pos = np.vstack([old_pos, n1_pos.reshape(1,2), n2_pos.reshape(1,2)])
 
     n1_idx, n2_idx = N, N + 1
 
-    old_ei = graph_data.edge_index.numpy().T.tolist()
+    old_ei = graph_data.edge_index.detach().cpu().numpy().T.tolist()
     new_edges = old_ei + [
         [u, n1_idx], [n1_idx, u],
         [v, n1_idx], [n1_idx, v],
@@ -461,21 +634,26 @@ def apply_j_operator(graph_data: Data, u: int, v: int, w: int,
     ]
 
     keypoints = None
+    semantic_dirty = False
     if hasattr(graph_data, 'keypoints') and graph_data.keypoints is not None:
-        keypoints = graph_data.keypoints.clone().detach()
+        semantic_dirty = True
     elif hasattr(graph_data, 'knee_idx') and graph_data.knee_idx is not None:
         knee_idx = int(graph_data.knee_idx.reshape(-1)[0].item())
         if knee_idx >= 0:
             keypoints = torch.tensor([n2_idx, knee_idx, n1_idx], dtype=torch.long)
 
-    out = Data(
+    out_kwargs = dict(
         x=torch.tensor(new_x, dtype=torch.float32),
         pos=torch.tensor(new_pos, dtype=torch.float32),
         edge_index=torch.tensor(new_edges, dtype=torch.long).T,
-        keypoints=keypoints,
     )
+    if keypoints is not None:
+        out_kwargs["keypoints"] = keypoints
+    out = Data(**out_kwargs)
     if hasattr(graph_data, 'knee_idx') and graph_data.knee_idx is not None:
         out.knee_idx = graph_data.knee_idx.clone().detach()
+    if semantic_dirty:
+        out.semantic_dirty = torch.tensor([True], dtype=torch.bool)
     return out
 
 

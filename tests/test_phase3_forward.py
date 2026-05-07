@@ -20,6 +20,7 @@ from dataset_tool import sample_to_pyg
 from src.data_load import DataLoaderFactory
 from src.forward_metrics import compute_forward_metrics_batch
 from src.generative_curve.GNN_model_biokinematics import BioKinematicsGNN
+from src.inverse.rl_env import inspect_forward_checkpoint_compatibility
 
 
 def _mock_sample(family: str = "8bar", sample_id: int = 3) -> dict[str, object]:
@@ -108,6 +109,23 @@ class TestPhase3Forward(unittest.TestCase):
         self.assertAlmostEqual(metrics["foot_chamfer"][0].item(), 0.0, places=6)
         self.assertAlmostEqual(metrics["knee_nmae"][0].item(), 0.0, places=6)
         self.assertAlmostEqual(metrics["ankle_nmae"][0].item(), 0.0, places=6)
+
+    def test_forward_checkpoint_guard_detects_legacy_no_context_variant(self):
+        cfg = {
+            "encoder": {"hidden_dim": 128, "node_input_dim": 8},
+            "decoder": {"family_embedding_dim": 16, "step_context_hidden_dim": 16},
+        }
+        legacy_state = {
+            "encoder.pre_mlp_nodes.weight": torch.zeros((128, 4), dtype=torch.float32),
+            "decoder_foot.linear_li.0.weight": torch.zeros((128, 128), dtype=torch.float32),
+        }
+
+        result = inspect_forward_checkpoint_compatibility(legacy_state, cfg)
+
+        self.assertEqual(result["checkpoint_variant"], "legacy_4d_no_context")
+        self.assertIn("node_input_dim mismatch", "; ".join(result["issues"]))
+        self.assertIn("family_embedding", "; ".join(result["issues"]))
+        self.assertIn("step_context_encoder", "; ".join(result["issues"]))
 
     def test_family_filter_remaps_precomputed_split_for_6bar_baseline(self):
         tmp_dir = WORKSPACE_ROOT / "demo" / "outputs" / "phase3_unit_family_filter"

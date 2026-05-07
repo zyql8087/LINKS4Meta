@@ -280,6 +280,15 @@ class PPOAgent:
             'structure_reasons': Counter(),
             'valid_action': False,
         }
+        if not bool(getattr(self.policy, 'geometry_code_ready', True)):
+            diagnostics['failure_reason'] = 'geometry_code_unavailable'
+            diagnostics['geometry_code_issue'] = str(
+                getattr(self.policy, 'geometry_code_issue', 'geometry code runtime is not ready')
+            )
+            status = getattr(self.policy, 'geometry_code_status', None)
+            if status is not None:
+                diagnostics['geometry_code_status'] = dict(status)
+            return None, 0.0, self._finalize_diagnostics(diagnostics)
         if not topologies:
             diagnostics['failure_reason'] = 'no_topology'
             return None, 0.0, self._finalize_diagnostics(diagnostics)

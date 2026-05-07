@@ -18,6 +18,7 @@ for root in (GMM_ROOT, GMM_ROOT / "code"):
         sys.path.insert(0, str(root))
 
 from src.inverse.gnn_policy import GNNPolicy
+from src.inverse.action_codebook import build_action_codebook
 from src.inverse.phase4_il import (
     ensure_multistep_expert_paths,
     evaluate_multistep_reconstruction,
@@ -217,6 +218,20 @@ class TestPhase4IL(unittest.TestCase):
         self.assertIn("semantic_mask", paths[0])
         self.assertIn("trace_prefix", paths[0])
         self.assertIn("seed_graph", paths[0])
+
+    def test_action_codebook_builder_uses_running_mean_and_assignments(self):
+        step_paths = [
+            {"action_code_bucket": "semantic_67", "action_code_vec": np.array([0.10, 0.10, 0.10, 0.10, 1.0, 1.0], dtype=np.float32)},
+            {"action_code_bucket": "semantic_67", "action_code_vec": np.array([0.12, 0.08, 0.11, 0.09, 1.0, 1.0], dtype=np.float32)},
+            {"action_code_bucket": "semantic_67", "action_code_vec": np.array([0.90, 0.90, 0.90, 0.90, -1.0, -1.0], dtype=np.float32)},
+        ]
+
+        codebook = build_action_codebook(step_paths, cluster_radius=0.10, max_codes_per_bucket=4)
+
+        self.assertEqual(len(codebook["entries"]), 2)
+        self.assertEqual(sorted(int(entry["count"]) for entry in codebook["entries"]), [1, 2])
+        self.assertEqual(len(codebook["item_assignments"]), 3)
+        self.assertEqual(len(codebook["bucket_to_ids"]["semantic_67"]), 2)
 
     def test_step_split_keeps_same_trace_in_one_group(self):
         paths = ensure_multistep_expert_paths(str(self.pkl_path), str(self.cache_path), use_cached=False)

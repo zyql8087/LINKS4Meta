@@ -45,6 +45,75 @@ class TestExperimentPipeline(unittest.TestCase):
         self.assertTrue(hasattr(out, 'keypoints'))
         self.assertEqual(out.keypoints.tolist(), [5, 2, 4])
 
+    def test_apply_j_operator_invalidates_stale_keypoints(self):
+        base_graph = Data(
+            x=torch.tensor([
+                [0.0, 0.0, 1.0, 1.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0, 0.0],
+                [1.0, 0.0, 1.0, 0.0],
+            ], dtype=torch.float32),
+            pos=torch.tensor([
+                [0.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+                [1.0, 0.0],
+            ], dtype=torch.float32),
+            edge_index=torch.tensor([
+                [0, 1, 1, 2, 2, 3, 3, 0],
+                [1, 0, 2, 1, 3, 2, 0, 3],
+            ], dtype=torch.long),
+            keypoints=torch.tensor([3, 1, 2], dtype=torch.long),
+        )
+
+        out = apply_j_operator(
+            base_graph,
+            u=1,
+            v=2,
+            w=0,
+            n1_pos=torch.tensor([0.4, 0.8]).numpy(),
+            n2_pos=torch.tensor([0.5, 0.3]).numpy(),
+        )
+
+        self.assertFalse(hasattr(out, 'keypoints') and out.keypoints is not None)
+        self.assertTrue(bool(out.semantic_dirty.view(-1)[0].item()))
+
+    def test_apply_j_operator_preserves_rich_feature_width(self):
+        base_graph = Data(
+            x=torch.tensor([
+                [0.0, 0.0, 1.0, 1.0, 9.0, 9.0, 9.0, 9.0],
+                [0.0, 1.0, 0.0, 0.0, 8.0, 8.0, 8.0, 8.0],
+                [1.0, 1.0, 0.0, 0.0, 7.0, 7.0, 7.0, 7.0],
+                [1.0, 0.0, 1.0, 0.0, 6.0, 6.0, 6.0, 6.0],
+            ], dtype=torch.float32),
+            pos=torch.tensor([
+                [0.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+                [1.0, 0.0],
+            ], dtype=torch.float32),
+            edge_index=torch.tensor([
+                [0, 1, 1, 2, 2, 3, 3, 0],
+                [1, 0, 2, 1, 3, 2, 0, 3],
+            ], dtype=torch.long),
+            keypoints=torch.tensor([3, 1, 2], dtype=torch.long),
+        )
+
+        out = apply_j_operator(
+            base_graph,
+            u=1,
+            v=2,
+            w=0,
+            n1_pos=torch.tensor([0.4, 0.8]).numpy(),
+            n2_pos=torch.tensor([0.5, 0.3]).numpy(),
+        )
+
+        self.assertEqual(out.x.size(-1), 8)
+        self.assertTrue(torch.allclose(out.x[4, :2], torch.tensor([0.4, 0.8], dtype=torch.float32)))
+        self.assertTrue(torch.allclose(out.x[5, :2], torch.tensor([0.5, 0.3], dtype=torch.float32)))
+        self.assertTrue(torch.allclose(out.x[4, 2:], torch.zeros(6, dtype=torch.float32)))
+        self.assertTrue(torch.allclose(out.x[5, 2:], torch.zeros(6, dtype=torch.float32)))
+
     def test_validate_graph_structure_rejects_crossing_edges(self):
         graph = Data(
             x=torch.tensor([

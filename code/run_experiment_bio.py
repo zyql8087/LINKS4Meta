@@ -241,6 +241,8 @@ def main():
     for bundle_name, bundle in bundles.items():
         if bundle is not None and bundle.get("checkpoint_warning"):
             print(f"[Phase6 Experiment] warning ({bundle_name}): {bundle['checkpoint_warning']}")
+        if bundle is not None and not bool(bundle.get("geometry_code_ready", True)):
+            print(f"[Phase6 Experiment] geometry-code not ready ({bundle_name}): {bundle.get('geometry_code_issue')}")
 
     methods = ALL_METHODS if args.methods == "all" else [item.strip() for item in args.methods.split(",") if item.strip()]
     train_features = stack_target_features([trace["target"] for trace in train_traces], weights=cfg.get("experiment", {}).get("retrieval_weights", {}))
@@ -259,6 +261,9 @@ def main():
                 "checkpoint_path": bundle.get("checkpoint_path"),
                 "checkpoint_loaded": bool(bundle.get("checkpoint_loaded")),
                 "checkpoint_warning": bundle.get("checkpoint_warning"),
+                "geometry_code_ready": bool(bundle.get("geometry_code_ready", True)),
+                "geometry_code_issue": bundle.get("geometry_code_issue"),
+                "geometry_code_status": bundle.get("geometry_code_status"),
             }
             for name, bundle in bundles.items()
         },

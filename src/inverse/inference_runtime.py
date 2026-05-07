@@ -18,23 +18,106 @@ def demo_root_from_workspace(workspace_root: Path) -> Path:
     return (workspace_root.parent / "demo").resolve()
 
 
+def inspect_inverse_checkpoint_geometry_code_state(
+    checkpoint: Optional[dict],
+    *,
+    checkpoint_loaded: bool,
+    action_codebook: Optional[dict],
+    action_codebook_source: Optional[str],
+    dataset_path: Optional[str],
+) -> dict:
+    policy_state = {}
+    if isinstance(checkpoint, dict):
+        maybe_policy = checkpoint.get("policy")
+        if isinstance(maybe_policy, dict):
+            policy_state = maybe_policy
+
+    policy_keys = list(policy_state.keys())
+    has_geometry_code_head = any(str(key).startswith("geometry_code_head.") for key in policy_keys)
+    has_legacy_geo_head = any(str(key).startswith("geo_head.") for key in policy_keys)
+    has_action_heads = any(
+        str(key).startswith(prefix)
+        for key in policy_keys
+        for prefix in ("action_u_head.", "action_v_head.", "action_w_head.")
+    )
+    if has_geometry_code_head:
+        checkpoint_variant = "geometry_code_head"
+    elif has_legacy_geo_head:
+        checkpoint_variant = "legacy_geo_head"
+    elif has_action_heads:
+        checkpoint_variant = "action_topology_only"
+    elif checkpoint is None:
+        checkpoint_variant = "missing_checkpoint"
+    else:
+        checkpoint_variant = "unknown"
+
+    codebook_entry_count = int(len((action_codebook or {}).get("entries", [])))
+    codebook_bucket_count = int(len((action_codebook or {}).get("bucket_to_ids", {})))
+    codebook_path = None
+    if dataset_path:
+        codebook_path = str(Path(dataset_path).with_suffix(".codebook.pt"))
+
+    issues = []
+    warnings = []
+    if not checkpoint_loaded:
+        issues.append("inverse checkpoint weights were not loaded")
+    if not has_geometry_code_head:
+        if has_legacy_geo_head:
+            issues.append("checkpoint predates geometry_code_head and only contains legacy geo_head")
+        else:
+            issues.append("checkpoint does not contain geometry_code_head parameters")
+    if action_codebook is None:
+        if codebook_path:
+            issues.append(
+                f"no action codebook loaded; expected checkpoint-embedded codebook or external codebook at '{codebook_path}'"
+            )
+        else:
+            issues.append("no action codebook loaded and no dataset path was configured for fallback")
+    elif codebook_entry_count <= 0:
+        issues.append("loaded action codebook has zero entries")
+
+    if action_codebook is not None and codebook_bucket_count <= 0:
+        warnings.append("loaded action codebook has no bucket_to_ids mapping; rollout will fall back to the full code range")
+
+    ready = bool(checkpoint_loaded and has_geometry_code_head and codebook_entry_count > 0)
+    issue = "; ".join(issues) if issues else None
+    return {
+        "ready": ready,
+        "issue": issue,
+        "warnings": warnings,
+        "checkpoint_variant": checkpoint_variant,
+        "checkpoint_has_geometry_code_head": bool(has_geometry_code_head),
+        "checkpoint_has_legacy_geo_head": bool(has_legacy_geo_head),
+        "action_codebook_source": action_codebook_source,
+        "action_codebook_entries": codebook_entry_count,
+        "action_codebook_bucket_count": codebook_bucket_count,
+        "dataset_path": dataset_path,
+        "codebook_path": codebook_path,
+    }
+
+
 def load_inverse_bundle(
     cfg: dict,
     ckpt_path: str,
     device,
     *,
     allow_fresh_fallback: bool,
+    require_geometry_code_ready: bool = False,
 ) -> Optional[dict]:
     ckpt = None
     action_codebook = None
+    action_codebook_source = None
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         action_codebook = ckpt.get("action_codebook")
+        if action_codebook is not None:
+            action_codebook_source = "checkpoint"
+    paths_cfg = cfg.get("paths", {})
+    dataset_path = paths_cfg.get("il_multistep_dataset_output") or paths_cfg.get("il_dataset_output")
     if action_codebook is None:
-        paths_cfg = cfg.get("paths", {})
-        dataset_path = paths_cfg.get("il_multistep_dataset_output") or paths_cfg.get("il_dataset_output")
         if dataset_path and os.path.exists(str(Path(dataset_path).with_suffix(".codebook.pt"))):
             action_codebook = load_action_codebook(dataset_path)
+            action_codebook_source = "external"
     if action_codebook is not None:
         cfg.setdefault("gnn_policy", {})
         cfg["gnn_policy"]["num_geometry_codes"] = max(1, len(action_codebook.get("entries", [])))
@@ -81,6 +164,26 @@ def load_inverse_bundle(
             return None
         warning = f"checkpoint missing: {ckpt_path}; using fresh weights"
 
+    geometry_code_status = inspect_inverse_checkpoint_geometry_code_state(
+        ckpt,
+        checkpoint_loaded=checkpoint_loaded,
+        action_codebook=action_codebook,
+        action_codebook_source=action_codebook_source,
+        dataset_path=str(dataset_path) if dataset_path else None,
+    )
+    if warning and geometry_code_status["warnings"]:
+        warning = f"{warning}; {'; '.join(geometry_code_status['warnings'])}"
+    elif geometry_code_status["warnings"]:
+        warning = "; ".join(geometry_code_status["warnings"])
+
+    policy.geometry_code_ready = bool(geometry_code_status["ready"])
+    policy.geometry_code_issue = geometry_code_status["issue"]
+    policy.geometry_code_status = dict(geometry_code_status)
+    if require_geometry_code_ready and not policy.geometry_code_ready:
+        raise RuntimeError(
+            f"Inverse bundle '{ckpt_path}' is not rollout-ready: {policy.geometry_code_issue}"
+        )
+
     policy.eval()
     curve_encoder.eval()
     return {
@@ -91,6 +194,10 @@ def load_inverse_bundle(
         "checkpoint_loaded": checkpoint_loaded,
         "checkpoint_warning": warning,
         "action_codebook": action_codebook,
+        "action_codebook_source": action_codebook_source,
+        "geometry_code_ready": bool(geometry_code_status["ready"]),
+        "geometry_code_issue": geometry_code_status["issue"],
+        "geometry_code_status": geometry_code_status,
     }
 
 

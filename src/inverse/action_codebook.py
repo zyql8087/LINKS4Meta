@@ -190,25 +190,32 @@ def build_action_codebook(
     bucket_to_ids: dict[str, list[int]] = {}
 
     for bucket, samples in sorted(grouped.items()):
+        print(f"[*] Building action codebook bucket '{bucket}' from {len(samples)} samples ...")
         clusters: list[dict[str, object]] = []
         for item_idx, vector in samples:
             if not clusters:
-                clusters.append({"center": vector.copy(), "items": [item_idx], "vectors": [vector.copy()]})
+                clusters.append({"center": vector.copy(), "count": 1})
                 continue
             distances = [float(np.linalg.norm(vector - cluster["center"])) for cluster in clusters]
             best_idx = int(np.argmin(distances))
             if distances[best_idx] <= float(cluster_radius):
                 cluster = clusters[best_idx]
-                cluster["items"].append(item_idx)
-                cluster["vectors"].append(vector.copy())
-                cluster["center"] = np.mean(np.stack(cluster["vectors"], axis=0), axis=0).astype(np.float32)
+                count = int(cluster["count"])
+                cluster["center"] = ((cluster["center"] * count) + vector) / float(count + 1)
+                cluster["center"] = np.asarray(cluster["center"], dtype=np.float32)
+                cluster["count"] = count + 1
             else:
-                clusters.append({"center": vector.copy(), "items": [item_idx], "vectors": [vector.copy()]})
+                clusters.append({"center": vector.copy(), "count": 1})
 
-        clusters.sort(key=lambda cluster: len(cluster["items"]), reverse=True)
+        raw_cluster_count = len(clusters)
+        clusters.sort(key=lambda cluster: int(cluster["count"]), reverse=True)
         clusters = clusters[: max(1, int(max_codes_per_bucket))]
         bucket_ids: list[int] = []
         bucket_centers = [np.asarray(cluster["center"], dtype=np.float32) for cluster in clusters]
+        print(
+            f"[*] Bucket '{bucket}' clustering complete: raw_clusters={raw_cluster_count}, "
+            f"kept={len(clusters)}"
+        )
 
         for cluster in clusters:
             global_id = len(entries)
@@ -217,7 +224,7 @@ def build_action_codebook(
                     "id": global_id,
                     "bucket": bucket,
                     "vector": np.asarray(cluster["center"], dtype=np.float32).tolist(),
-                    "count": int(len(cluster["items"])),
+                    "count": int(cluster["count"]),
                 }
             )
             bucket_ids.append(global_id)

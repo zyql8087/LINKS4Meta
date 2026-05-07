@@ -106,6 +106,9 @@ def main():
     if bundle is None:
         print(f"[Error] Failed to load inverse bundle from '{weight_path}'")
         return
+    if not bool(bundle.get("geometry_code_ready", True)):
+        print(f"[Error] Inverse bundle is not rollout-ready: {bundle.get('geometry_code_issue')}")
+        return
     print(f"[Inference] Loaded `{args.model_type}` weights from '{weight_path}'")
 
     surrogate, _ = load_frozen_surrogate(cfg["paths"]["forward_model"], cfg["paths"]["config_forward"], device)

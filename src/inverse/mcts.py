@@ -8,7 +8,7 @@ import torch
 from torch_geometric.data import Batch, Data
 
 from src.inverse.experiment_utils import compute_joint_metrics_batch, compute_reward_batch
-from src.inverse.rl_env import _prepare_graph_for_surrogate
+from src.inverse.rl_env import _prepare_graph_for_surrogate, validate_graph_structure
 
 
 @dataclass
@@ -100,35 +100,12 @@ class MCTS:
     ) -> List[Dict]:
         if not candidates:
             return []
-        prepared_graphs = [
-            _prepare_graph_for_surrogate(
-                candidate.graph,
-                family_index=family_index,
-                step_index=candidate.step_count,
-                expected_j_steps=expected_j_steps,
-            )
-            for candidate in candidates
-        ]
-        batch = Batch.from_data_list(prepared_graphs).to(self.device)
-        with torch.no_grad():
-            pred_foot, pred_knee, pred_ankle = self.surrogate(batch)
-        reward_t, _ = compute_reward_batch(
-            pred_foot.cpu(),
-            pred_knee.cpu(),
-            pred_ankle.cpu(),
-            target,
-            self.cfg.get("reward", {}),
-        )
-        metrics = compute_joint_metrics_batch(
-            pred_foot.cpu(),
-            pred_knee.cpu(),
-            pred_ankle.cpu(),
-            target,
-            self.cfg.get("reward", {}),
-        )
-
+        constraint_cfg = self.cfg.get("constraints", {})
         scored = []
-        for idx, candidate in enumerate(candidates):
+        valid_candidates = []
+        valid_scored_indices = []
+        for candidate in candidates:
+            is_valid, valid_info = validate_graph_structure(candidate.graph, constraint_cfg)
             scored.append(
                 {
                     "graph": candidate.graph,
@@ -136,12 +113,52 @@ class MCTS:
                     "stopped": candidate.stopped,
                     "step_count": candidate.step_count,
                     "policy_log_prob": float(candidate.log_prob),
-                    "surrogate_reward": float(reward_t[idx].item()),
-                    "joint_score": float(metrics["joint_score"][idx].item()),
-                    "valid": 1.0,
+                    "surrogate_reward": float("-inf"),
+                    "joint_score": float("inf"),
+                    "valid": 1.0 if is_valid else 0.0,
+                    "invalid_reason": None if is_valid else valid_info.get("reason", "invalid_structure"),
                 }
             )
-        scored.sort(key=lambda item: (item["surrogate_reward"], item["policy_log_prob"]), reverse=True)
+            if is_valid:
+                valid_candidates.append(candidate)
+                valid_scored_indices.append(len(scored) - 1)
+
+        if valid_candidates:
+            prepared_graphs = [
+                _prepare_graph_for_surrogate(
+                    candidate.graph,
+                    family_index=family_index,
+                    step_index=candidate.step_count,
+                    expected_j_steps=expected_j_steps,
+                    target=target,
+                )
+                for candidate in valid_candidates
+            ]
+            batch = Batch.from_data_list(prepared_graphs).to(self.device)
+            with torch.no_grad():
+                pred_foot, pred_knee, pred_ankle = self.surrogate(batch)
+            reward_t, _ = compute_reward_batch(
+                pred_foot.cpu(),
+                pred_knee.cpu(),
+                pred_ankle.cpu(),
+                target,
+                self.cfg.get("reward", {}),
+            )
+            metrics = compute_joint_metrics_batch(
+                pred_foot.cpu(),
+                pred_knee.cpu(),
+                pred_ankle.cpu(),
+                target,
+                self.cfg.get("reward", {}),
+            )
+            for local_idx, scored_idx in enumerate(valid_scored_indices):
+                scored[scored_idx]["surrogate_reward"] = float(reward_t[local_idx].item())
+                scored[scored_idx]["joint_score"] = float(metrics["joint_score"][local_idx].item())
+
+        scored.sort(
+            key=lambda item: (item["valid"], item["surrogate_reward"], item["policy_log_prob"]),
+            reverse=True,
+        )
         return scored
 
     def rerank_rollouts(
