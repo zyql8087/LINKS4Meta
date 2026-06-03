@@ -30,12 +30,13 @@ from src.inverse.rl_env import (
     load_frozen_surrogate,
     validate_graph_structure,
 )
+from src.inverse.readout_assignment import SurrogateTargetReadoutAssignment
 
 
 ALL_METHODS = ["retrieval_baseline", "il_only", "il_rl", "il_rl_mcts"]
 
 
-def _predict_metrics(graph, trace_record, surrogate, cfg, device):
+def _predict_metrics(graph, trace_record, surrogate, cfg, device, *, readout_assigner=None):
     penalty_metric = 1e6
     base_metrics = {
         "joint_score": penalty_metric,
@@ -60,6 +61,8 @@ def _predict_metrics(graph, trace_record, surrogate, cfg, device):
         family_index=int(trace_record["family_index"]),
         step_index=int(trace_record["expected_j_steps"]),
         expected_j_steps=int(trace_record["expected_j_steps"]),
+        target=target,
+        readout_assigner=readout_assigner,
     )
     batch = Batch.from_data_list([prepared_graph]).to(device)
     with torch.no_grad():
@@ -135,6 +138,17 @@ def _evaluate_method(method_name, traces, train_traces, train_features, bundles,
     metric_rows = []
     search_diagnostics = []
 
+    readout_assigner = None
+    if surrogate is not None:
+        reward_cfg = cfg.get("reward", {})
+        readout_assigner = SurrogateTargetReadoutAssignment(
+            surrogate,
+            top_k=3,
+            batch_size=64,
+            metric_cfg=reward_cfg,
+            device=device,
+        )
+
     for trace in traces:
         start_t = time.time()
         if method_name == "retrieval_baseline":
@@ -154,7 +168,7 @@ def _evaluate_method(method_name, traces, train_traces, train_features, bundles,
         else:
             raise ValueError(f"Unsupported method: {method_name}")
         elapsed = time.time() - start_t
-        metric = _predict_metrics(graph, trace, surrogate, cfg, device)
+        metric = _predict_metrics(graph, trace, surrogate, cfg, device, readout_assigner=readout_assigner)
         elapsed_times.append(elapsed)
         metrics.append(metric)
         metric_rows.append(

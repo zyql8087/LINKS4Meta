@@ -12,11 +12,50 @@ from src.inverse.readout_assignment import (
     LearnedChainScorerReadoutAssignment,
     RuleBasedReadoutAssignment,
     SlotPointerReadoutAssignment,
+    SurrogateTargetReadoutAssignment,
     build_synthetic_readout_records,
     enumerate_leg_candidates,
     evaluate_assignment_module,
 )
 from src.inverse.rl_env import _infer_semantic_masks, _prepare_graph_for_surrogate
+
+
+class FakeTargetAwareSurrogate(torch.nn.Module):
+    def __init__(self, target, truth):
+        super().__init__()
+        self.good_foot = torch.tensor(target.y_foot, dtype=torch.float32)
+        self.good_knee = torch.tensor(target.y_knee, dtype=torch.float32)
+        self.good_ankle = torch.tensor(target.y_ankle, dtype=torch.float32)
+        self.truth = {name: int(value) for name, value in truth.items()}
+
+    def _local_mask_index(self, mask, graph_nodes):
+        selected = torch.nonzero(mask[graph_nodes], as_tuple=False).view(-1)
+        if selected.numel() == 0:
+            return -1
+        return int(selected[0].item())
+
+    def forward(self, data):
+        num_graphs = int(data.batch.max().item()) + 1 if data.batch.numel() else 1
+        foot_rows = []
+        knee_rows = []
+        ankle_rows = []
+        for graph_idx in range(num_graphs):
+            graph_nodes = torch.nonzero(data.batch == graph_idx, as_tuple=False).view(-1)
+            keypoints = {
+                "knee": self._local_mask_index(data.mask_knee, graph_nodes),
+                "ankle": self._local_mask_index(data.mask_ankle, graph_nodes),
+                "foot": self._local_mask_index(data.mask_foot, graph_nodes),
+            }
+            matches = all(keypoints[name] == self.truth[name] for name in ("knee", "ankle", "foot"))
+            if matches:
+                foot_rows.append(self.good_foot)
+                knee_rows.append(self.good_knee)
+                ankle_rows.append(self.good_ankle)
+            else:
+                foot_rows.append(torch.ones_like(self.good_foot) * 3.0)
+                knee_rows.append(torch.ones_like(self.good_knee) * 3.0)
+                ankle_rows.append(torch.ones_like(self.good_ankle) * 3.0)
+        return torch.stack(foot_rows), torch.stack(knee_rows), torch.stack(ankle_rows)
 
 
 class TestReadoutAssignment(unittest.TestCase):
@@ -130,6 +169,66 @@ class TestReadoutAssignment(unittest.TestCase):
         candidates = enumerate_leg_candidates(graph, require_consecutive_semantic_chain=True)
         self.assertTrue(candidates)
         self.assertTrue(all(candidate.path[-3:] == (candidate.knee, candidate.ankle, candidate.foot) for candidate in candidates))
+
+    def test_graph_target_without_motion_does_not_default_to_perfect_target_error(self):
+        record = build_synthetic_readout_records(num_records=1, seed=7)[0]
+        candidates = enumerate_leg_candidates(record.graph, target=record.target, motion=None)
+
+        self.assertTrue(candidates)
+        for candidate in candidates:
+            self.assertEqual(candidate.features["has_motion"], 0.0)
+            self.assertEqual(candidate.features["has_target"], 1.0)
+            self.assertEqual(candidate.features["target_error_available"], 0.0)
+            self.assertEqual(candidate.features["foot_target_error"], 1.0)
+            self.assertEqual(candidate.features["knee_target_error"], 1.0)
+            self.assertEqual(candidate.features["ankle_target_error"], 1.0)
+
+    def test_surrogate_target_assignment_uses_target_without_motion(self):
+        record = build_synthetic_readout_records(num_records=1, seed=7)[0]
+        module = SurrogateTargetReadoutAssignment(
+            FakeTargetAwareSurrogate(record.target, record.truth),
+            top_k=3,
+            batch_size=16,
+            metric_cfg={"w_foot": 0.5, "w_knee": 0.25, "w_ankle": 0.25},
+        )
+
+        result = module.assign(record.graph, target=record.target, motion=None)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.method, "D_surrogate_target_chain_assignment")
+        self.assertEqual(result.keypoints["knee"], record.truth["knee"])
+        self.assertEqual(result.keypoints["ankle"], record.truth["ankle"])
+        self.assertEqual(result.keypoints["foot"], record.truth["foot"])
+        self.assertIn("joint_score", result.score_breakdown)
+
+    def test_infer_semantic_masks_accepts_surrogate_target_assigner(self):
+        record = build_synthetic_readout_records(num_records=1, seed=7)[0]
+        graph = Data(
+            x=torch.tensor(record.graph["x"], dtype=torch.float32),
+            pos=torch.tensor(record.graph["pos"], dtype=torch.float32),
+            edge_index=torch.tensor(record.graph["edge_index"], dtype=torch.long),
+        )
+        assigner = SurrogateTargetReadoutAssignment(
+            FakeTargetAwareSurrogate(record.target, record.truth),
+            top_k=3,
+            batch_size=16,
+        )
+
+        mask_hip, mask_knee, mask_ankle, mask_foot = _infer_semantic_masks(
+            graph,
+            target={
+                "y_foot": torch.tensor(record.target.y_foot, dtype=torch.float32),
+                "y_knee": torch.tensor(record.target.y_knee, dtype=torch.float32),
+                "y_ankle": torch.tensor(record.target.y_ankle, dtype=torch.float32),
+            },
+            motion=None,
+            readout_assigner=assigner,
+        )
+
+        self.assertEqual(int(mask_hip.sum().item()), 1)
+        self.assertTrue(bool(mask_knee[record.truth["knee"]].item()))
+        self.assertTrue(bool(mask_ankle[record.truth["ankle"]].item()))
+        self.assertTrue(bool(mask_foot[record.truth["foot"]].item()))
 
     def test_enumeration_supports_anchor_hip_and_nonmonotonic_anchor_depth(self):
         graph = {

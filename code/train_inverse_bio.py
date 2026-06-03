@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import random
 import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import matplotlib
@@ -23,12 +26,16 @@ from src.inverse.curve_encoder import CurveEncoder
 from src.inverse.gnn_policy import GNNPolicy, policy_load_incompatibilities
 from src.inverse.family_index_builder import build_family_index_artifacts
 from src.inverse.phase4_il import (
+    attach_oracle_code_targets,
     build_stage_plan,
     compute_phase4_losses,
     ensure_multistep_expert_paths,
     evaluate_multistep_reconstruction,
     filter_paths_by_families,
+    generate_rollout_aware_samples,
+    group_paths_by_trace,
     load_step_split,
+    scheduled_sampling_ratio,
     subset_by_indices,
 )
 from src.inverse.action_codebook import codebook_tensor, load_action_codebook
@@ -54,7 +61,24 @@ TRACKED_METRICS = (
     "action_u_accuracy",
     "action_v_accuracy",
     "action_w_accuracy",
+    "topology_exact",
+    "action_code_accuracy_raw",
+    "action_code_accuracy_bucket",
     "action_code_accuracy",
+    "action_code_top1",
+    "action_code_top3",
+    "action_code_top5",
+    "oracle_equiv_top1",
+    "oracle_equiv_top3",
+    "oracle_equiv_top5",
+    "loss_action_code_hard_ce",
+    "loss_oracle_soft_ce",
+    "loss_oracle_rank",
+    "loss_validity_margin",
+    "oracle_positive_coverage",
+    "oracle_uncovered_rate",
+    "oracle_best_valid_available_rate",
+    "full_step_exact",
     "step_action_accuracy",
 )
 
@@ -78,8 +102,9 @@ def _format_metrics(metrics):
         [
             f"obj={metrics['objective']:.6f}",
             f"code_acc={metrics['action_code_accuracy']:.4f}",
+            f"topo={metrics['topology_exact']:.4f}",
             f"stop_acc={metrics['stop_accuracy']:.4f}",
-            f"step_acc={metrics['step_action_accuracy']:.4f}",
+            f"full_step={metrics['full_step_exact']:.4f}",
             f"role_acc={metrics['step_role_accuracy']:.4f}",
         ]
     )
@@ -89,12 +114,51 @@ def _to_float_dict(metrics):
     return {key: float(value) for key, value in metrics.items()}
 
 
+def _oracle_batch_tensors(chunk, num_codes: int, device) -> dict[str, torch.Tensor]:
+    positive_mask = torch.zeros((len(chunk), num_codes), dtype=torch.bool, device=device)
+    soft_targets = torch.zeros((len(chunk), num_codes), dtype=torch.float32, device=device)
+    valid_mask = torch.zeros((len(chunk), num_codes), dtype=torch.bool, device=device)
+    best_valid = torch.full((len(chunk),), -1, dtype=torch.long, device=device)
+    uncovered = torch.ones((len(chunk),), dtype=torch.bool, device=device)
+    temperature = 0.02
+
+    for row_idx, item in enumerate(chunk):
+        for code_id in item.get("valid_code_ids", []) or []:
+            code_id = int(code_id)
+            if 0 <= code_id < num_codes:
+                valid_mask[row_idx, code_id] = True
+        positives = [int(code_id) for code_id in (item.get("oracle_positive_ids", []) or []) if 0 <= int(code_id) < num_codes]
+        errors = [float(value) for value in (item.get("oracle_positive_errors", []) or [])]
+        if positives:
+            uncovered[row_idx] = False
+            weights = torch.ones((len(positives),), dtype=torch.float32, device=device)
+            if len(errors) == len(positives):
+                weights = torch.exp(-torch.tensor(errors, dtype=torch.float32, device=device) / temperature)
+            weights = weights / torch.clamp(weights.sum(), min=1.0e-12)
+            for local_idx, code_id in enumerate(positives):
+                positive_mask[row_idx, code_id] = True
+                soft_targets[row_idx, code_id] = weights[local_idx]
+        best_id = int(item.get("best_valid_code_id", -1))
+        if 0 <= best_id < num_codes:
+            best_valid[row_idx] = best_id
+        uncovered[row_idx] = bool(item.get("oracle_uncovered", not positives))
+
+    return {
+        "oracle_positive_mask": positive_mask,
+        "oracle_soft_targets": soft_targets,
+        "oracle_valid_mask": valid_mask,
+        "oracle_best_valid_code_id": best_valid,
+        "oracle_uncovered": uncovered,
+    }
+
+
 class PreBatchedLoader:
-    def __init__(self, dataset, batch_size: int, device, shuffle: bool = True):
+    def __init__(self, dataset, batch_size: int, device, shuffle: bool = True, num_geometry_codes: int | None = None):
         self.batch_size = batch_size
         self.device = device
         self.shuffle = shuffle
         self.batches = []
+        self.num_geometry_codes = num_geometry_codes
 
         print(f"  Pre-batching {len(dataset)} multistep IL samples to {device} (batch_size={batch_size}) ...")
         indices = list(range(len(dataset)))
@@ -131,6 +195,17 @@ class PreBatchedLoader:
                     device=device,
                 ),
             }
+            if any("oracle_positive_ids" in item for item in chunk):
+                num_codes = int(num_geometry_codes or 0)
+                if num_codes <= 0:
+                    candidate_ids = []
+                    for item in chunk:
+                        candidate_ids.extend(int(idx) for idx in item.get("oracle_candidate_ids", []) or [])
+                        candidate_ids.extend(int(idx) for idx in item.get("valid_code_ids", []) or [])
+                        candidate_ids.extend(int(idx) for idx in item.get("oracle_positive_ids", []) or [])
+                        candidate_ids.append(int(item["action_code_id"]))
+                    num_codes = max(candidate_ids, default=0) + 1
+                batch.update(_oracle_batch_tensors(chunk, num_codes, device))
             self.batches.append(batch)
 
         print(f"  Pre-batching done: {len(self.batches)} batches cached on {device}")
@@ -166,6 +241,77 @@ def train_epoch_prebatched(policy, curve_encoder, optimizer, loader, cfg, all_pa
         optimizer.step()
         _accumulate_metric_sums(metric_sums, metrics)
     return _average_metric_sums(metric_sums, len(loader))
+
+
+def _combine_weighted_metrics(weighted_metrics):
+    total_weight = sum(float(weight) for _, weight in weighted_metrics)
+    if total_weight <= 0:
+        return {key: 0.0 for key in TRACKED_METRICS}
+    return {
+        key: sum(float(metrics[key]) * float(weight) for metrics, weight in weighted_metrics) / total_weight
+        for key in TRACKED_METRICS
+    }
+
+
+def _merge_rollout_aware_cfg(il_cfg: dict, stage_cfg: dict) -> dict:
+    merged = dict(il_cfg.get("rollout_aware", {}) or {})
+    merged.update(stage_cfg.get("rollout_aware", {}) or {})
+    return merged
+
+
+def _select_rollout_seed_paths(paths, *, max_traces: int | None, seed: int):
+    traces = group_paths_by_trace(paths)
+    rng = random.Random(int(seed))
+    rng.shuffle(traces)
+    if max_traces is not None:
+        traces = traces[: max(0, int(max_traces))]
+    return [step for trace in traces for step in trace]
+
+
+def _desired_augmented_count(train_count: int, ratio: float, max_count: int | None) -> int:
+    ratio = max(0.0, min(0.95, float(ratio)))
+    if ratio <= 0.0:
+        return 0
+    desired = int(round(float(train_count) * ratio / max(1.0e-6, 1.0 - ratio)))
+    if max_count is not None:
+        desired = min(desired, int(max_count))
+    return max(0, desired)
+
+
+def _sample_augmented_paths(paths, desired_count: int, *, seed: int):
+    if desired_count <= 0 or not paths:
+        return []
+    if len(paths) <= desired_count:
+        return list(paths)
+    rng = random.Random(int(seed))
+    return rng.sample(list(paths), int(desired_count))
+
+
+def _family_counts(paths) -> dict[str, int]:
+    counts = Counter(str(item.get("family_id", "unknown")) for item in paths)
+    return dict(sorted(counts.items()))
+
+
+def _load_initial_il_checkpoint_if_configured(policy, curve_encoder, il_cfg: dict, device):
+    checkpoint_path = il_cfg.get("initial_checkpoint")
+    if not checkpoint_path:
+        return {"loaded": False}
+    checkpoint_path = str(checkpoint_path)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"initial IL checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    policy_state = policy.load_state_dict(checkpoint.get("policy", {}), strict=False)
+    missing_keys, unexpected_keys = policy_load_incompatibilities(policy_state)
+    if missing_keys or unexpected_keys:
+        raise RuntimeError(
+            f"Initial IL checkpoint incompatible. Missing={missing_keys}, unexpected={unexpected_keys}"
+        )
+    curve_encoder.load_state_dict(checkpoint.get("curve_encoder", {}), strict=False)
+    return {
+        "loaded": True,
+        "path": checkpoint_path,
+        "phase": checkpoint.get("phase"),
+    }
 
 
 def eval_epoch_prebatched(policy, curve_encoder, loader, cfg):
@@ -233,6 +379,46 @@ def _stage_summary(stage_cfg, train_paths, val_paths, test_paths):
     }
 
 
+def _limit_paths_per_family_role(paths, max_per_group: int, seed: int):
+    if max_per_group <= 0:
+        return list(paths)
+    grouped = defaultdict(list)
+    for item in paths:
+        grouped[(str(item["family_id"]), str(item["step_role"]))].append(item)
+    rng = random.Random(seed)
+    limited = []
+    for key in sorted(grouped):
+        items = list(grouped[key])
+        rng.shuffle(items)
+        limited.extend(items[:max_per_group])
+    return sorted(limited, key=lambda item: (int(item["trace_id"]), int(item["step_index"]), int(item["expert_step_id"])))
+
+
+def _balanced_reconstruction_by_family(policy, curve_encoder, paths, cfg, device, max_traces_per_family: int):
+    report = {}
+    for family in ("6bar", "7bar", "8bar", "9bar"):
+        family_paths = filter_paths_by_families(paths, [family])
+        traces = group_paths_by_trace(family_paths)
+        selected_trace_ids = {
+            int(trace[0]["trace_id"])
+            for trace in traces[: max(0, int(max_traces_per_family))]
+        }
+        selected_paths = [
+            item
+            for item in family_paths
+            if int(item["trace_id"]) in selected_trace_ids
+        ]
+        report[family] = evaluate_multistep_reconstruction(
+            policy,
+            curve_encoder,
+            selected_paths,
+            cfg,
+            device,
+            max_traces=max_traces_per_family,
+        )
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description="Phase4 multistep IL pretraining")
     parser.add_argument("--config", type=str, default="src/train_links4meta_il.yaml")
@@ -293,11 +479,24 @@ def main():
         pkl_path=paths_cfg["pkl_dataset"],
         output_path=multistep_dataset_path,
         use_cached=args.skip_extract,
+        action_codebook_cfg=cfg.get("action_codebook", {}),
+        constraint_cfg=cfg.get("constraints", {}),
     )
     action_codebook = load_action_codebook(multistep_dataset_path)
     cfg.setdefault("gnn_policy", {})
     cfg["gnn_policy"]["num_geometry_codes"] = max(1, len(action_codebook.get("entries", [])))
     cfg["gnn_policy"]["action_code_dim"] = int(action_codebook.get("code_dim", 6))
+    oracle_code_report = None
+    if bool(il_cfg.get("oracle_code_loss", {}).get("enabled", False)):
+        print("[*] Precomputing oracle geometry-code targets ...")
+        expert_paths, oracle_code_report = attach_oracle_code_targets(expert_paths, action_codebook, cfg)
+        overall = oracle_code_report.get("overall", {})
+        print(
+            "[*] Oracle code targets: "
+            f"coverage={float(overall.get('oracle_positive_coverage_rate', 0.0)):.4f} "
+            f"valid_available={float(overall.get('valid_code_available_rate', 0.0)):.4f} "
+            f"uncovered={float(overall.get('oracle_uncovered_rate', 0.0)):.4f}"
+        )
     print(f"[*] Total multistep expert samples: {len(expert_paths)}")
 
     split = load_step_split(
@@ -311,6 +510,16 @@ def main():
     base_train_paths = subset_by_indices(expert_paths, split["train_indices"])
     base_val_paths = subset_by_indices(expert_paths, split["val_indices"])
     base_test_paths = subset_by_indices(expert_paths, split["test_indices"])
+    max_steps_per_family_role = int(il_cfg.get("max_steps_per_family_role", 0) or 0)
+    if max_steps_per_family_role > 0:
+        base_train_paths = _limit_paths_per_family_role(
+            base_train_paths,
+            max_steps_per_family_role,
+            int(il_cfg.get("split_seed", 42)),
+        )
+        if bool(il_cfg.get("overfit_use_train_subset_for_eval", False)):
+            base_val_paths = list(base_train_paths)
+            base_test_paths = list(base_train_paths)
     print(
         f"[*] Using {split.get('split_source')} from {split.get('source_path')} | "
         f"train={len(base_train_paths)} val={len(base_val_paths)} test={len(base_test_paths)}"
@@ -371,8 +580,10 @@ def main():
                 print(f"[*] LINKS pretrain complete: {paths_cfg['links_pretrain_model_output']}")
             else:
                 print("[*] LINKS pretrain enabled but checkpoint missing; continuing without pretrained encoder.")
+    initial_checkpoint_report = _load_initial_il_checkpoint_if_configured(policy, curve_encoder, il_cfg, device)
+    if initial_checkpoint_report.get("loaded"):
+        print(f"[*] Loaded initial IL checkpoint: {initial_checkpoint_report['path']}")
     all_params = list(policy.parameters()) + list(curve_encoder.parameters())
-    optimizer = optim.Adam(all_params, lr=il_cfg["learning_rate"])
 
     stage_plan = build_stage_plan(il_cfg)
     history_by_stage = {}
@@ -390,35 +601,106 @@ def main():
             f"\n[*] {stage_cfg['name']} families={stage_cfg['families']} | "
             f"train={len(train_paths)} val={len(val_paths)} test={len(test_paths)}"
         )
-        train_loader = PreBatchedLoader(train_paths, il_cfg["batch_size"], device, shuffle=True)
-        val_loader = PreBatchedLoader(val_paths, il_cfg["batch_size"], device, shuffle=False)
-        test_loader = PreBatchedLoader(test_paths, il_cfg["batch_size"], device, shuffle=False)
+        num_geometry_codes = int(cfg["gnn_policy"].get("num_geometry_codes", 0))
+        train_loader = PreBatchedLoader(train_paths, il_cfg["batch_size"], device, shuffle=True, num_geometry_codes=num_geometry_codes)
+        val_loader = PreBatchedLoader(val_paths, il_cfg["batch_size"], device, shuffle=False, num_geometry_codes=num_geometry_codes)
+        test_loader = PreBatchedLoader(test_paths, il_cfg["batch_size"], device, shuffle=False, num_geometry_codes=num_geometry_codes)
         selection_loader = val_loader if len(val_loader) > 0 else (test_loader if len(test_loader) > 0 else train_loader)
 
         stage_history = {
             "train_objective": [],
             "val_objective": [],
             "val_step_action_accuracy": [],
+            "val_full_step_exact": [],
             "val_stop_accuracy": [],
+            "scheduled_sampling_ratio": [],
+            "rollout_aug_sample_count": [],
+            "rollout_aug_by_family": [],
+            "rollout_aug_drop_reasons": [],
         }
+        stage_lr = float(stage_cfg.get("learning_rate", il_cfg["learning_rate"]))
+        optimizer = optim.Adam(all_params, lr=stage_lr)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, int(stage_cfg["epochs"])))
         best_val_objective = float("inf")
         patience_counter = 0
         best_local_state = None
+        rollout_cfg = _merge_rollout_aware_cfg(il_cfg, stage_cfg)
+        rollout_cache = []
+        rollout_report = {"generated_count": 0, "by_family": {}, "drop_reasons": {}, "examples": []}
+        refresh_every = max(1, int(rollout_cfg.get("refresh_every_epochs", 1)))
+        max_rollout_traces = rollout_cfg.get("max_traces_per_refresh")
+        max_rollout_samples = rollout_cfg.get("max_generated_samples")
 
         for epoch in range(int(stage_cfg["epochs"])):
-            train_metrics = train_epoch_prebatched(policy, curve_encoder, optimizer, train_loader, cfg, all_params)
+            stage_ratio_cfg = dict(stage_cfg)
+            stage_ratio_cfg["rollout_aware"] = rollout_cfg
+            sampling_ratio = scheduled_sampling_ratio(
+                stage_ratio_cfg,
+                epoch=epoch,
+                total_epochs=int(stage_cfg["epochs"]),
+            )
+            epoch_report = rollout_report
+            epoch_aug_paths = []
+            if sampling_ratio > 0.0:
+                if epoch % refresh_every == 0 or not rollout_cache:
+                    seed_paths = _select_rollout_seed_paths(
+                        train_paths,
+                        max_traces=max_rollout_traces,
+                        seed=int(il_cfg.get("split_seed", 23)) + epoch,
+                    )
+                    rollout_cache, rollout_report = generate_rollout_aware_samples(
+                        policy,
+                        curve_encoder,
+                        seed_paths,
+                        cfg,
+                        device,
+                        max_samples=max_rollout_samples,
+                    )
+                    if bool(il_cfg.get("oracle_code_loss", {}).get("enabled", False)) and rollout_cache:
+                        rollout_cache, rollout_oracle_report = attach_oracle_code_targets(rollout_cache, action_codebook, cfg)
+                        rollout_report["oracle_code_targets"] = rollout_oracle_report
+                    epoch_report = rollout_report
+                desired_aug_count = _desired_augmented_count(
+                    len(train_paths),
+                    sampling_ratio,
+                    rollout_cfg.get("max_epoch_augmented_samples", max_rollout_samples),
+                )
+                epoch_aug_paths = _sample_augmented_paths(
+                    rollout_cache,
+                    min(desired_aug_count, len(rollout_cache)),
+                    seed=int(il_cfg.get("split_seed", 23)) + epoch + 1009,
+                )
+
+            train_metrics_main = train_epoch_prebatched(policy, curve_encoder, optimizer, train_loader, cfg, all_params)
+            weighted_train_metrics = [(train_metrics_main, max(1, len(train_loader)))]
+            if epoch_aug_paths:
+                aug_loader = PreBatchedLoader(
+                    epoch_aug_paths,
+                    il_cfg["batch_size"],
+                    device,
+                    shuffle=True,
+                    num_geometry_codes=num_geometry_codes,
+                )
+                aug_metrics = train_epoch_prebatched(policy, curve_encoder, optimizer, aug_loader, cfg, all_params)
+                weighted_train_metrics.append((aug_metrics, max(1, len(aug_loader))))
+            train_metrics = _combine_weighted_metrics(weighted_train_metrics)
             val_metrics = eval_epoch_prebatched(policy, curve_encoder, selection_loader, cfg)
             scheduler.step()
 
             stage_history["train_objective"].append(train_metrics["objective"])
             stage_history["val_objective"].append(val_metrics["objective"])
             stage_history["val_step_action_accuracy"].append(val_metrics["step_action_accuracy"])
+            stage_history["val_full_step_exact"].append(val_metrics["full_step_exact"])
             stage_history["val_stop_accuracy"].append(val_metrics["stop_accuracy"])
+            stage_history["scheduled_sampling_ratio"].append(float(sampling_ratio))
+            stage_history["rollout_aug_sample_count"].append(int(len(epoch_aug_paths)))
+            stage_history["rollout_aug_by_family"].append(_family_counts(epoch_aug_paths))
+            stage_history["rollout_aug_drop_reasons"].append(dict(epoch_report.get("drop_reasons", {})))
             print(
                 f"Epoch [{epoch + 1:3d}/{int(stage_cfg['epochs'])}]  "
                 f"Train {_format_metrics(train_metrics)}  "
-                f"Val {_format_metrics(val_metrics)}"
+                f"Val {_format_metrics(val_metrics)}  "
+                f"rollout_ratio={sampling_ratio:.3f} rollout_aug={len(epoch_aug_paths)}"
             )
 
             if val_metrics["objective"] < best_val_objective:
@@ -429,6 +711,7 @@ def main():
                     "curve_encoder": {key: value.detach().cpu() for key, value in curve_encoder.state_dict().items()},
                     "action_codebook": action_codebook,
                     "links_pretrain": pretrain_report or {},
+                    "initial_checkpoint": initial_checkpoint_report,
                 }
             else:
                 patience_counter += 1
@@ -459,6 +742,14 @@ def main():
             device,
             max_traces=il_cfg.get("max_reconstruction_traces", 256),
         )
+        balanced_reconstruction = _balanced_reconstruction_by_family(
+            policy,
+            curve_encoder,
+            _select_eval_paths(train_paths, val_paths, test_paths),
+            cfg,
+            device,
+            max_traces_per_family=int(il_cfg.get("max_reconstruction_traces_per_family", 64)),
+        )
         stage_report = {
             **_stage_summary(stage_cfg, train_paths, val_paths, test_paths),
             "best_val_objective": float(best_val_objective),
@@ -466,6 +757,11 @@ def main():
             "val_metrics": _to_float_dict(final_val_metrics) if final_val_metrics else {},
             "test_metrics": _to_float_dict(final_test_metrics) if final_test_metrics else {},
             "reconstruction": reconstruction,
+            "balanced_reconstruction_by_family": balanced_reconstruction,
+            "rollout_aware": {
+                "config": rollout_cfg,
+                "last_generation_report": rollout_report,
+            },
             "history": stage_history,
         }
         stage_reports.append(stage_report)
@@ -493,6 +789,7 @@ def main():
         },
         "links_pretrain": pretrain_report or {},
         "family_index": family_index_report or {},
+        "oracle_code_targets": oracle_code_report or {},
         "stages": stage_reports,
         "final_checkpoint": model_path,
     }

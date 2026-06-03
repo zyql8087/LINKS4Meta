@@ -147,7 +147,7 @@ paths:
   links_pretrain_cache_output: "../../demo/outputs/pretrain/links_pretrain_cache.pt"
   links_pretrain_model_output: "../../demo/outputs/checkpoints/graphmetamat_links/model_inverse_links_pretrain.pt"
   links_pretrain_report_output: "../../demo/outputs/reports/links_pretrain_report.json"
-  forward_model: "../../demo/outputs/checkpoints/graphmetamat_links/model_bio_best.pt"
+  forward_model: "../../demo/outputs/checkpoints/graphmetamat_links_phase3_full/model_bio_best.pt"
   config_forward: "config_model_bio.yaml"
   il_dataset_output: "../../LINKS-main/output/data_gen_v2_final80k_20260331/il_expert_paths_multibase_80k.pt"
   il_multistep_dataset_output: "../../LINKS-main/output/data_gen_v2_final80k_20260331/il_expert_paths_multistep_multibase_80k.pt"

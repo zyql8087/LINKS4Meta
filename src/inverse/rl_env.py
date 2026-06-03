@@ -15,7 +15,11 @@ from typing import Optional
 from torch_geometric.data import Data, Batch
 
 from src.inverse.experiment_utils import compute_joint_metrics_batch, compute_reward_batch
-from src.inverse.readout_assignment import RuleBasedReadoutAssignment, assignment_to_masks
+from src.inverse.readout_assignment import (
+    RuleBasedReadoutAssignment,
+    SurrogateTargetReadoutAssignment,
+    assignment_to_masks,
+)
 
 
 _DEFAULT_READOUT_ASSIGNER = RuleBasedReadoutAssignment(top_k=3)
@@ -160,12 +164,36 @@ def _build_phase3_step_context(step_index: int, expected_j_steps: int) -> torch.
     )
 
 
+def _build_surrogate_readout_assigner(
+    surrogate,
+    reward_cfg: Optional[dict],
+    device,
+    *,
+    family_index: int,
+    step_index: int,
+    expected_j_steps: int,
+):
+    if surrogate is None:
+        return None
+    return SurrogateTargetReadoutAssignment(
+        surrogate,
+        top_k=3,
+        batch_size=64,
+        metric_cfg=reward_cfg or {},
+        device=device,
+        family_index=int(family_index),
+        step_index=int(step_index),
+        expected_j_steps=int(expected_j_steps),
+    )
+
+
 def _infer_semantic_masks(
     graph_data: Data,
     *,
     target: Optional[dict] = None,
     motion=None,
     allow_assignment_fallback: bool = True,
+    readout_assigner=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_nodes = int(graph_data.x.size(0))
     device = graph_data.x.device
@@ -223,7 +251,8 @@ def _infer_semantic_masks(
                 mask_knee[knee_idx] = True
 
     if allow_assignment_fallback and (not mask_knee.any() or not mask_ankle.any() or not mask_foot.any()):
-        assignment = _DEFAULT_READOUT_ASSIGNER.assign(graph_data, target=target, motion=motion)
+        assigner = readout_assigner or _DEFAULT_READOUT_ASSIGNER
+        assignment = assigner.assign(graph_data, target=target, motion=motion)
         if assignment is not None:
             inferred = assignment_to_masks(assignment, num_nodes, device=device)
             if not mask_hip.any():
@@ -246,6 +275,7 @@ def _prepare_graph_for_surrogate(
     expected_j_steps: int,
     target: Optional[dict] = None,
     motion=None,
+    readout_assigner=None,
 ) -> Data:
     prepared = copy.deepcopy(graph_data)
     x = prepared.x.float()
@@ -255,6 +285,7 @@ def _prepare_graph_for_surrogate(
         prepared,
         target=target,
         motion=motion,
+        readout_assigner=readout_assigner,
     )
     semantic = torch.stack(
         [
@@ -371,7 +402,7 @@ def validate_graph_structure(graph_data: Data, constraint_cfg: Optional[dict] = 
 
 
 def compute_reward(surrogate, graph_data: Data, target: dict,
-                   reward_cfg: dict, device, constraint_cfg: Optional[dict] = None) -> tuple:
+                   reward_cfg: dict, device, constraint_cfg: Optional[dict] = None, readout_assigner=None) -> tuple:
     """
     Single-graph reward computation (fallback path).
     """
@@ -380,12 +411,21 @@ def compute_reward(surrogate, graph_data: Data, target: dict,
         return reward_cfg.get('penalty_locking', -100.0), False, valid_info
 
     try:
+        assigner = readout_assigner or _build_surrogate_readout_assigner(
+            surrogate,
+            reward_cfg,
+            device,
+            family_index=-1,
+            step_index=0,
+            expected_j_steps=1,
+        )
         prepared_graph = _prepare_graph_for_surrogate(
             graph_data,
             family_index=-1,
             step_index=0,
             expected_j_steps=1,
             target=target,
+            readout_assigner=assigner,
         )
         batch = Batch.from_data_list([prepared_graph]).to(device)
         with torch.no_grad():
@@ -419,7 +459,7 @@ def compute_reward(surrogate, graph_data: Data, target: dict,
 
 
 def batch_compute_rewards(surrogate, graphs: list, target: dict,
-                          reward_cfg: dict, device, constraint_cfg: Optional[dict] = None) -> list:
+                          reward_cfg: dict, device, constraint_cfg: Optional[dict] = None, readout_assigner=None) -> list:
     """
     Batch-compute rewards for a list of graphs in ONE GPU call.
     Returns list of (reward, valid) tuples.
@@ -448,6 +488,14 @@ def batch_compute_rewards(surrogate, graphs: list, target: dict,
             step_index=0,
             expected_j_steps=1,
             target=target,
+            readout_assigner=readout_assigner or _build_surrogate_readout_assigner(
+                surrogate,
+                reward_cfg,
+                device,
+                family_index=-1,
+                step_index=0,
+                expected_j_steps=1,
+            ),
         )
         for graph in valid_graphs
     ]
@@ -471,6 +519,7 @@ def batch_compute_rewards(surrogate, graphs: list, target: dict,
                 reward_cfg,
                 device,
                 constraint_cfg=constraint_cfg,
+                readout_assigner=readout_assigner,
             )
             results[idx] = (reward if valid else penalty, valid)
         return results
@@ -488,6 +537,7 @@ def batch_compute_phase5_rewards(
     expected_j_steps: int,
     family_index: int = -1,
     constraint_cfg: Optional[dict] = None,
+    readout_assigner=None,
 ) -> tuple[list[tuple[float, bool]], list[dict[str, float]]]:
     """
     Strategy-A phase5 reward:
@@ -532,16 +582,27 @@ def batch_compute_phase5_rewards(
     ]
 
     if valid_graphs:
-        prepared_graphs = [
-            _prepare_graph_for_surrogate(
-                graph,
-                family_index=family_index,
-                step_index=int(step_indices[graph_idx]),
+        prepared_graphs = []
+        for graph, graph_idx in zip(valid_graphs, valid_graph_indices):
+            step_index = int(step_indices[graph_idx])
+            assigner = readout_assigner or _build_surrogate_readout_assigner(
+                surrogate,
+                reward_cfg,
+                device,
+                family_index=int(family_index),
+                step_index=step_index,
                 expected_j_steps=int(expected_j_steps),
-                target=target,
             )
-            for graph, graph_idx in zip(valid_graphs, valid_graph_indices)
-        ]
+            prepared_graphs.append(
+                _prepare_graph_for_surrogate(
+                    graph,
+                    family_index=family_index,
+                    step_index=step_index,
+                    expected_j_steps=int(expected_j_steps),
+                    target=target,
+                    readout_assigner=assigner,
+                )
+            )
         batch = Batch.from_data_list(prepared_graphs).to(device)
         with torch.no_grad():
             pred_foot, pred_knee, pred_ankle = surrogate(batch)

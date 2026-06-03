@@ -8,6 +8,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.data import Batch, Data
+
+from src.inverse.experiment_utils import compute_joint_metrics_batch
 
 
 _CANDIDATE_FEATURE_ORDER = (
@@ -25,6 +28,9 @@ _CANDIDATE_FEATURE_ORDER = (
     "knee_amp",
     "ankle_amp",
     "circle_penalty",
+    "has_motion",
+    "has_target",
+    "target_error_available",
     "foot_target_error",
     "knee_target_error",
     "ankle_target_error",
@@ -43,6 +49,8 @@ _NODE_FEATURE_ORDER = (
     "motion_curvature",
     "motion_loop_closure",
     "motion_isotropy",
+    "has_motion",
+    "has_target",
     "knee_target_error",
     "ankle_target_error",
     "foot_target_error",
@@ -142,6 +150,32 @@ def _maybe_array(value, *, min_ndim: int) -> np.ndarray | None:
     if array.ndim < min_ndim:
         return None
     return array
+
+
+def _target_has_any_curve(target: AssignmentTarget | None) -> bool:
+    return bool(
+        target is not None
+        and (
+            target.y_foot is not None
+            or target.y_knee is not None
+            or target.y_ankle is not None
+        )
+    )
+
+
+def _target_has_all_curves(target: AssignmentTarget | None) -> bool:
+    return bool(
+        target is not None
+        and target.y_foot is not None
+        and target.y_knee is not None
+        and target.y_ankle is not None
+    )
+
+
+def _graph_value(graph: object, name: str, default=None):
+    if isinstance(graph, Mapping):
+        return graph.get(name, default)
+    return getattr(graph, name, default)
 
 
 def _graph_arrays(graph: object) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -409,6 +443,8 @@ def _build_candidate(
     target: AssignmentTarget | None,
 ) -> CandidateLegChain:
     max_depth = max(1, int(depth.max()))
+    has_motion = bool(motion is not None and motion.shape[0] > foot)
+    has_target = _target_has_any_curve(target)
     foot_anchor_bonus = 1.0 if any(anchors[nbr] for nbr in adjacency[foot]) else 0.0
     branch_penalty = _clip01((len(adjacency[knee]) + len(adjacency[ankle]) - 4) / 4.0)
     knee_pos = int(path.index(knee))
@@ -429,12 +465,15 @@ def _build_candidate(
         "knee_amp": 0.0,
         "ankle_amp": 0.0,
         "circle_penalty": 0.0,
-        "foot_target_error": 0.0,
-        "knee_target_error": 0.0,
-        "ankle_target_error": 0.0,
+        "has_motion": 1.0 if has_motion else 0.0,
+        "has_target": 1.0 if has_target else 0.0,
+        "target_error_available": 0.0,
+        "foot_target_error": 1.0 if target is not None and target.y_foot is not None else 0.0,
+        "knee_target_error": 1.0 if target is not None and target.y_knee is not None else 0.0,
+        "ankle_target_error": 1.0 if target is not None and target.y_ankle is not None else 0.0,
     }
 
-    if motion is not None and motion.shape[0] > foot:
+    if has_motion:
         curves = _candidate_curves(motion, hip=hip, knee=knee, ankle=ankle, foot=foot)
         foot_traj = curves["foot"]
         rom_x, rom_y = _trajectory_span(foot_traj)
@@ -450,6 +489,7 @@ def _build_candidate(
             features["foot_target_error"] = _normalized_curve_error(curves["foot"], target.y_foot)
             features["knee_target_error"] = _normalized_curve_error(curves["knee"], target.y_knee)
             features["ankle_target_error"] = _normalized_curve_error(curves["ankle"], target.y_ankle)
+            features["target_error_available"] = 1.0 if has_target else 0.0
 
     motion_score = (
         0.55 * features["foot_rom_x"]
@@ -539,6 +579,222 @@ class RuleBasedReadoutAssignment:
         best = ranked[0]
         return AssignmentResult(
             method="A_rule_based_chain_assignment",
+            keypoints=best.keypoints(),
+            path=best.path,
+            score=float(best.score),
+            score_breakdown=dict(best.score_breakdown),
+            candidate_count=len(ranked),
+            top_candidates=ranked[: self.top_k],
+        )
+
+
+def _step_context_from_indices(step_index: int | None, expected_j_steps: int | None) -> torch.Tensor | None:
+    if step_index is None or expected_j_steps is None:
+        return None
+    semantic_steps = 1 if int(step_index) >= int(expected_j_steps) else 0
+    aux_steps = max(0, int(step_index) - semantic_steps)
+    return torch.tensor([[float(step_index), float(aux_steps), float(semantic_steps)]], dtype=torch.float32)
+
+
+def _candidate_surrogate_data(
+    graph: object,
+    candidate: CandidateLegChain,
+    *,
+    family_index: int | None = None,
+    step_index: int | None = None,
+    expected_j_steps: int | None = None,
+) -> Data:
+    x, pos, edge_index = _graph_arrays(graph)
+    num_nodes = int(x.shape[0])
+    base = np.zeros((num_nodes, 4), dtype=np.float32)
+    base[:, : min(4, x.shape[1])] = x[:, : min(4, x.shape[1])]
+    semantic = np.zeros((num_nodes, 4), dtype=np.float32)
+    for col, idx in enumerate((candidate.hip, candidate.knee, candidate.ankle, candidate.foot)):
+        if 0 <= int(idx) < num_nodes:
+            semantic[int(idx), col] = 1.0
+    data = Data(
+        x=torch.tensor(np.concatenate([base, semantic], axis=1), dtype=torch.float32),
+        pos=torch.tensor(pos, dtype=torch.float32),
+        edge_index=torch.tensor(edge_index, dtype=torch.long),
+        mask_hip=torch.tensor(semantic[:, 0] > 0.5, dtype=torch.bool),
+        mask_knee=torch.tensor(semantic[:, 1] > 0.5, dtype=torch.bool),
+        mask_ankle=torch.tensor(semantic[:, 2] > 0.5, dtype=torch.bool),
+        mask_foot=torch.tensor(semantic[:, 3] > 0.5, dtype=torch.bool),
+        semantic_feature_layout=torch.tensor([1], dtype=torch.long),
+        semantic_dirty=torch.tensor([False], dtype=torch.bool),
+    )
+
+    resolved_family = family_index
+    if resolved_family is None:
+        raw_family = _graph_value(graph, "family_id")
+        if raw_family is not None:
+            if isinstance(raw_family, str):
+                resolved_family = {"6bar": 0, "7bar": 1, "8bar": 2, "9bar": 3}.get(raw_family)
+            else:
+                resolved_family = int(torch.as_tensor(raw_family).view(-1)[0].item())
+    if resolved_family is not None:
+        data.family_id = torch.tensor([int(resolved_family)], dtype=torch.long)
+
+    resolved_step_context = _step_context_from_indices(step_index, expected_j_steps)
+    if resolved_step_context is None:
+        raw_step_context = _graph_value(graph, "step_context")
+        if raw_step_context is not None:
+            resolved_step_context = torch.as_tensor(raw_step_context, dtype=torch.float32).view(1, -1)
+    if resolved_step_context is not None:
+        data.step_context = resolved_step_context.float()
+    return data
+
+
+def _assignment_target_to_tensor_dict(target: AssignmentTarget) -> dict[str, torch.Tensor]:
+    if not _target_has_all_curves(target):
+        raise ValueError("Surrogate target readout requires y_foot, y_knee, and y_ankle.")
+    return {
+        "y_foot": torch.tensor(target.y_foot, dtype=torch.float32),
+        "y_knee": torch.tensor(target.y_knee, dtype=torch.float32),
+        "y_ankle": torch.tensor(target.y_ankle, dtype=torch.float32),
+    }
+
+
+class SurrogateTargetReadoutAssignment:
+    def __init__(
+        self,
+        surrogate_model,
+        *,
+        top_k: int = 5,
+        batch_size: int = 64,
+        metric_cfg: Mapping[str, float] | None = None,
+        device: torch.device | str | None = None,
+        structural_prior_weight: float = 0.05,
+        require_consecutive_semantic_chain: bool = False,
+        family_index: int | None = None,
+        step_index: int | None = None,
+        expected_j_steps: int | None = None,
+    ):
+        self.surrogate_model = surrogate_model
+        self.top_k = int(top_k)
+        self.batch_size = int(batch_size)
+        self.metric_cfg = dict(metric_cfg or {})
+        self.structural_prior_weight = float(structural_prior_weight)
+        self.require_consecutive_semantic_chain = bool(require_consecutive_semantic_chain)
+        self.family_index = family_index
+        self.step_index = step_index
+        self.expected_j_steps = expected_j_steps
+        self.teacher = RuleBasedReadoutAssignment(
+            top_k=top_k,
+            require_consecutive_semantic_chain=self.require_consecutive_semantic_chain,
+        )
+        if device is not None:
+            self.device = torch.device(device)
+        else:
+            try:
+                self.device = next(surrogate_model.parameters()).device
+            except Exception:
+                self.device = torch.device("cpu")
+
+    def assign(
+        self,
+        graph: object,
+        *,
+        target: AssignmentTarget | Mapping[str, object] | None = None,
+        motion: np.ndarray | Mapping[str, object] | None = None,
+        family_index: int | None = None,
+        step_index: int | None = None,
+        expected_j_steps: int | None = None,
+    ) -> AssignmentResult | None:
+        target_obj = target if isinstance(target, AssignmentTarget) else AssignmentTarget.from_mapping(target)
+        if self.surrogate_model is None or not _target_has_all_curves(target_obj):
+            return self.teacher.assign(graph, target=target_obj, motion=motion)
+
+        candidates = enumerate_leg_candidates(
+            graph,
+            motion=None,
+            target=target_obj,
+            require_consecutive_semantic_chain=self.require_consecutive_semantic_chain,
+        )
+        if not candidates:
+            return None
+
+        target_dict = _assignment_target_to_tensor_dict(target_obj)
+        resolved_family = self.family_index if family_index is None else family_index
+        resolved_step = self.step_index if step_index is None else step_index
+        resolved_expected = self.expected_j_steps if expected_j_steps is None else expected_j_steps
+        ranked_candidates: list[CandidateLegChain] = []
+        was_training = bool(getattr(self.surrogate_model, "training", False))
+        self.surrogate_model.eval()
+
+        with torch.no_grad():
+            for start in range(0, len(candidates), self.batch_size):
+                chunk = candidates[start : start + self.batch_size]
+                data_list = [
+                    _candidate_surrogate_data(
+                        graph,
+                        candidate,
+                        family_index=resolved_family,
+                        step_index=resolved_step,
+                        expected_j_steps=resolved_expected,
+                    )
+                    for candidate in chunk
+                ]
+                batch = Batch.from_data_list(data_list).to(self.device)
+                pred_foot, pred_knee, pred_ankle = self.surrogate_model(batch)
+                metrics = compute_joint_metrics_batch(
+                    pred_foot,
+                    pred_knee,
+                    pred_ankle,
+                    target_dict,
+                    self.metric_cfg,
+                )
+                joint_scores = metrics["joint_score"].detach().cpu().numpy()
+                foot_scores = metrics["foot_score"].detach().cpu().numpy()
+                knee_scores = metrics["knee_nrmse"].detach().cpu().numpy()
+                ankle_scores = metrics["ankle_nrmse"].detach().cpu().numpy()
+                smoothness = metrics["smoothness"].detach().cpu().numpy()
+
+                for local_idx, candidate in enumerate(chunk):
+                    structural_prior = float(candidate.score_breakdown.get("structural", 0.0))
+                    prior_score = self.structural_prior_weight * structural_prior
+                    joint_score = float(joint_scores[local_idx])
+                    total = -joint_score + prior_score
+                    features = dict(candidate.features)
+                    features.update(
+                        {
+                            "has_target": 1.0,
+                            "target_error_available": 1.0,
+                            "foot_target_error": float(foot_scores[local_idx]),
+                            "knee_target_error": float(knee_scores[local_idx]),
+                            "ankle_target_error": float(ankle_scores[local_idx]),
+                            "surrogate_joint_score": joint_score,
+                            "surrogate_smoothness": float(smoothness[local_idx]),
+                        }
+                    )
+                    ranked_candidates.append(
+                        CandidateLegChain(
+                            hip=candidate.hip,
+                            knee=candidate.knee,
+                            ankle=candidate.ankle,
+                            foot=candidate.foot,
+                            path=candidate.path,
+                            features=features,
+                            score_breakdown={
+                                "surrogate_target": -joint_score,
+                                "structural_prior": prior_score,
+                                "joint_score": joint_score,
+                                "foot_score": float(foot_scores[local_idx]),
+                                "knee_nrmse": float(knee_scores[local_idx]),
+                                "ankle_nrmse": float(ankle_scores[local_idx]),
+                                "smoothness": float(smoothness[local_idx]),
+                                "total": total,
+                            },
+                            score=float(total),
+                        )
+                    )
+
+        if was_training:
+            self.surrogate_model.train()
+        ranked = sorted(ranked_candidates, key=lambda item: item.score, reverse=True)
+        best = ranked[0]
+        return AssignmentResult(
+            method="D_surrogate_target_chain_assignment",
             keypoints=best.keypoints(),
             path=best.path,
             score=float(best.score),
@@ -739,6 +995,8 @@ def _node_feature_matrix(
 ) -> tuple[np.ndarray, np.ndarray]:
     x, pos, edge_index = _graph_arrays(graph)
     num_nodes = int(x.shape[0])
+    has_motion = bool(motion is not None)
+    has_target = _target_has_any_curve(target)
     adjacency = _build_adjacency(num_nodes, edge_index)
     is_ground, is_fixed = _ground_and_fixed_masks(x)
     anchors = np.logical_or(is_ground, is_fixed)
@@ -783,6 +1041,8 @@ def _node_feature_matrix(
             "motion_curvature": 0.0,
             "motion_loop_closure": 0.0,
             "motion_isotropy": 0.0,
+            "has_motion": 1.0 if has_motion else 0.0,
+            "has_target": 1.0 if has_target else 0.0,
             "knee_target_error": float(slot_error_defaults["knee"][node_idx]),
             "ankle_target_error": float(slot_error_defaults["ankle"][node_idx]),
             "foot_target_error": float(slot_error_defaults["foot"][node_idx]),

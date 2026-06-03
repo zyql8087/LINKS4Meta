@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -15,7 +16,10 @@ for root in (GMM_ROOT, GMM_ROOT / "code"):
         sys.path.insert(0, str(root))
 
 from src.inverse.phase5_rl import build_family_curriculum, build_trace_dataset
-from src.inverse.inference_runtime import inspect_inverse_checkpoint_geometry_code_state
+from src.inverse.inference_runtime import (
+    inspect_inverse_checkpoint_geometry_code_state,
+    load_rollout_bundle_with_fallback,
+)
 from src.inverse.curve_encoder import CurveEncoder
 from src.inverse.gnn_policy import GNNPolicy
 from src.inverse.mcts import MCTS, RolloutCandidate
@@ -106,6 +110,117 @@ class TestPhase5RL(unittest.TestCase):
         self.assertIsNone(actions[0])
         self.assertEqual(diagnostics[0]["failure_reason"], "geometry_code_unavailable")
         self.assertIn("geometry_code_head", diagnostics[0]["geometry_code_issue"])
+
+    def test_batch_select_actions_normalizes_code_sampling_probabilities(self):
+        cfg = {
+            "gnn_policy": {
+                "node_input_dim": 4,
+                "edge_input_dim": 1,
+                "hidden_dim": 16,
+                "num_layers": 2,
+                "dropout": 0.0,
+                "num_families": 4,
+                "family_embedding_dim": 4,
+                "step_embedding_dim": 4,
+                "context_hidden_dim": 16,
+                "max_step_count": 2,
+                "num_geometry_codes": 2,
+                "action_code_dim": 6,
+            },
+            "curve_encoder": {"input_dim": 8, "hidden_dims": [16], "latent_dim": 8},
+            "rl_training": {"learning_rate": 1.0e-4},
+            "constraints": {"min_link_length": 0.05, "min_node_distance": 0.01, "intersection_eps": 1.0e-8},
+        }
+        policy = GNNPolicy(cfg)
+        policy.set_action_codebook(torch.zeros((2, 6), dtype=torch.float32))
+        policy.geometry_code_ready = True
+        curve_encoder = CurveEncoder(input_dim=8, hidden_dims=[16], latent_dim=8)
+        agent = PPOAgent(policy, curve_encoder, cfg, torch.device("cpu"))
+
+        with mock.patch.object(agent, "_topology_distribution", return_value=([(1, 2, 0)], np.array([1.0], dtype=np.float64))):
+            with mock.patch.object(agent, "_masked_code_distribution", return_value=([0, 1], np.array([0.50000001, 0.50000001], dtype=np.float64))):
+                with mock.patch.object(agent, "_passes_geometry_prior", return_value=(True, None)):
+                    with mock.patch("src.inverse.rl_agent.decode_local_dyad_code", return_value=(np.array([0.2, 0.7], dtype=np.float32), np.array([0.2, 0.3], dtype=np.float32))):
+                        actions, _, _, diagnostics = agent.batch_select_actions(
+                            [_base_4bar_graph()],
+                            torch.zeros((1, 8), dtype=torch.float32),
+                            deterministic=False,
+                            return_diagnostics=True,
+                            contexts=[{"family_index": 0, "step_index": 0, "expected_j_steps": 1, "can_stop": False}],
+                        )
+
+        self.assertIsNotNone(actions[0])
+        self.assertTrue(bool(diagnostics[0]["valid_action"]))
+
+    def test_load_rollout_bundle_falls_back_to_il_when_rl_not_ready(self):
+        cfg = {
+            "paths": {
+                "rl_model_output": "rl.pt",
+                "il_model_output": "il.pt",
+            }
+        }
+        bundles = {
+            "rl.pt": {
+                "checkpoint_path": "rl.pt",
+                "checkpoint_loaded": True,
+                "geometry_code_ready": False,
+                "geometry_code_issue": "legacy geo_head",
+                "geometry_code_status": {"ready": False},
+            },
+            "il.pt": {
+                "checkpoint_path": "il.pt",
+                "checkpoint_loaded": True,
+                "geometry_code_ready": True,
+                "geometry_code_issue": None,
+                "geometry_code_status": {"ready": True},
+            },
+        }
+
+        def _fake_load(cfg_arg, ckpt_path, device, *, allow_fresh_fallback, require_geometry_code_ready=False):
+            return dict(bundles[ckpt_path])
+
+        with mock.patch("src.inverse.inference_runtime.load_inverse_bundle", side_effect=_fake_load):
+            selected = load_rollout_bundle_with_fallback(
+                cfg,
+                torch.device("cpu"),
+                preferred_model_type="rl",
+                allow_fresh_fallback=False,
+            )
+
+        self.assertEqual(selected["selected_model_type"], "il")
+        self.assertTrue(bool(selected["fallback_used"]))
+        self.assertEqual(selected["bundle_candidates"]["rl"]["geometry_code_issue"], "legacy geo_head")
+
+    def test_load_rollout_bundle_keeps_requested_rl_when_ready(self):
+        cfg = {
+            "paths": {
+                "rl_model_output": "rl.pt",
+                "il_model_output": "il.pt",
+            }
+        }
+        ready_rl = {
+            "checkpoint_path": "rl.pt",
+            "checkpoint_loaded": True,
+            "geometry_code_ready": True,
+            "geometry_code_issue": None,
+            "geometry_code_status": {"ready": True},
+        }
+
+        def _fake_load(cfg_arg, ckpt_path, device, *, allow_fresh_fallback, require_geometry_code_ready=False):
+            if ckpt_path == "rl.pt":
+                return dict(ready_rl)
+            raise AssertionError("fallback should not load IL when RL is already ready")
+
+        with mock.patch("src.inverse.inference_runtime.load_inverse_bundle", side_effect=_fake_load):
+            selected = load_rollout_bundle_with_fallback(
+                cfg,
+                torch.device("cpu"),
+                preferred_model_type="rl",
+                allow_fresh_fallback=False,
+            )
+
+        self.assertEqual(selected["selected_model_type"], "rl")
+        self.assertFalse(bool(selected["fallback_used"]))
 
     def test_family_curriculum_order_matches_phase5(self):
         curriculum = build_family_curriculum({"episodes_per_family": 10})

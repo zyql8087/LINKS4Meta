@@ -1,13 +1,18 @@
+from __future__ import annotations
+
 import argparse
 import json
 import pickle
 import sys
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
+import torch
+import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,8 +27,11 @@ try:
         ReadoutAssignmentRecord,
         RuleBasedReadoutAssignment,
         SlotPointerReadoutAssignment,
+        SurrogateTargetReadoutAssignment,
         enumerate_leg_candidates,
     )
+    from src.forward_dataset_utils import build_step_context, family_name_to_id
+    from src.inverse.rl_env import load_frozen_surrogate
 except Exception as exc:  # pragma: no cover - runtime environment hint
     print(f"[ERROR] Failed to import real readout benchmark dependencies: {exc}")
     print("[HINT] Run this benchmark in the GMM environment.")
@@ -35,6 +43,7 @@ DEFAULT_INPUT_PKL = WORKSPACE_ROOT / "LINKS-main" / "output" / "data_gen_v2_fina
 DEFAULT_SPLIT_JSON = WORKSPACE_ROOT / "LINKS-main" / "output" / "data_gen_v2_final80k_20260331" / "split_indices_v2.json"
 DEFAULT_OUTPUT_JSON = WORKSPACE_ROOT / "demo" / "outputs" / "readout_assignment_fullsplit_modes_summary.json"
 DEFAULT_FAILURE_JSON = WORKSPACE_ROOT / "demo" / "outputs" / "readout_assignment_fullsplit_modes_failures.json"
+DEFAULT_INVERSE_CONFIG = PROJECT_ROOT / "src" / "config_inverse.yaml"
 
 MODE_SPECS = {
     "graph_motion_target": {
@@ -54,7 +63,7 @@ MODE_SPECS = {
     },
 }
 
-SCHEME_ORDER = ("scheme_a", "scheme_b", "scheme_c")
+SCHEME_ORDER = ("scheme_a", "scheme_b", "scheme_c", "scheme_d")
 
 
 @dataclass
@@ -83,6 +92,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--schemes", nargs="*", default=list(SCHEME_ORDER))
     parser.add_argument("--max_failures_per_scheme", type=int, default=12)
     parser.add_argument("--max_candidates_cap", type=int, default=256)
+    parser.add_argument("--config_inverse", type=Path, default=DEFAULT_INVERSE_CONFIG)
+    parser.add_argument("--forward_model_path", type=Path, default=None,
+        help="Override forward surrogate model path (bypasses config_inverse path resolution)")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--surrogate_batch_size", type=int, default=64)
+    parser.add_argument("--scheme_d_structural_prior_weight", type=float, default=None,
+        help="Override structural_prior_weight for scheme_d (default: class default 0.05)")
+    parser.add_argument("--scheme_d_top_k", type=int, default=None,
+        help="Override top_k for scheme_d (default: hardcoded 5)")
+    parser.add_argument("--target_shuffle_mode", type=str, default=None, choices=["within_family"],
+        help="Shuffle target curves within family for real-vs-shuffle F experiment")
     parser.add_argument("--output_json", type=Path, default=DEFAULT_OUTPUT_JSON)
     parser.add_argument("--failure_json", type=Path, default=DEFAULT_FAILURE_JSON)
     return parser.parse_args()
@@ -128,6 +148,13 @@ def _family_name(sample: dict) -> str:
     return str(family)
 
 
+def _resolve_path(path_value: str | Path, *, base_dir: Path) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return (base_dir / path).resolve()
+
+
 def _strip_graph_from_sample(sample: dict) -> dict[str, np.ndarray]:
     adjacency = np.asarray(sample["A"])
     x0 = np.asarray(sample["x0"], dtype=np.float32)
@@ -142,6 +169,8 @@ def _strip_graph_from_sample(sample: dict) -> dict[str, np.ndarray]:
         "x": x,
         "pos": x0.astype(np.float32),
         "edge_index": edges,
+        "family_id": np.array([family_name_to_id(_family_name(sample))], dtype=np.int64),
+        "step_context": build_step_context(sample)[None, :].astype(np.float32),
     }
 
 
@@ -219,6 +248,29 @@ def _select_eval_indices(
         per_family=per_family,
         seed=seed,
     )
+
+
+def _shuffle_targets_within_family(items: list["BenchmarkItem"], seed: int) -> None:
+    """Shuffle AssignmentTarget curves (y_foot/y_knee/y_ankle) within each family group."""
+    rng = np.random.RandomState(seed)
+    family_buckets: dict[str, list[int]] = defaultdict(list)
+    for idx, item in enumerate(items):
+        family_buckets[item.family].append(idx)
+
+    for family, indices in family_buckets.items():
+        if len(indices) < 2:
+            continue
+        targets = [items[idx].record.target for idx in indices]
+        # resolved copies for shuffling
+        resolved = []
+        for t in targets:
+            if isinstance(t, AssignmentTarget):
+                resolved.append(t)
+            else:
+                resolved.append(AssignmentTarget.from_mapping(t))
+        rng.shuffle(resolved)
+        for idx, new_target in zip(indices, resolved):
+            items[idx].record.target = new_target
 
 
 def _record_inputs_for_mode(record: ReadoutAssignmentRecord, mode_key: str) -> Tuple[object, Optional[np.ndarray], Optional[AssignmentTarget]]:
@@ -379,6 +431,7 @@ def _evaluate_detailed(
     foot = 0
     assigned = 0
     score_total = 0.0
+    raw_joint_score_total = 0.0
     by_family_counts: dict[str, dict[str, float]] = defaultdict(lambda: {
         "count": 0.0,
         "exact": 0.0,
@@ -389,15 +442,20 @@ def _evaluate_detailed(
     })
     failures: list[dict[str, object]] = []
     failure_buckets: Counter[str] = Counter()
+    assignment_times: list[float] = []
+    exact_mask: list[bool] = []
 
     for item in items:
         graph, motion, target = _record_inputs_for_mode(item.record, mode_key)
+        _t0 = time.time()
         result = module.assign(graph, motion=motion, target=target)
+        assignment_times.append(time.time() - _t0)
         family_stats = by_family_counts[item.family]
         family_stats["count"] += 1.0
 
         if result is None:
             family_stats["candidate_counts"].append(0)
+            exact_mask.append(False)
             failure_tags = ["no_assignment"] + _failure_tags(item, None)
             for tag in failure_tags:
                 failure_buckets[tag] += 1
@@ -433,11 +491,13 @@ def _evaluate_detailed(
         ankle += int(hit_ankle)
         foot += int(hit_foot)
         score_total += float(result.score)
+        raw_joint_score_total += float(result.score_breakdown.get("joint_score", 0.0))
 
         family_stats["exact"] += float(hit_exact)
         family_stats["knee"] += float(hit_knee)
         family_stats["ankle"] += float(hit_ankle)
         family_stats["foot"] += float(hit_foot)
+        exact_mask.append(bool(hit_exact))
 
         if not hit_exact and len(failures) < int(max_failures):
             failure_tags = _failure_tags(item, result)
@@ -479,7 +539,10 @@ def _evaluate_detailed(
         "ankle_accuracy": float(ankle / denom),
         "foot_accuracy": float(foot / denom),
         "mean_assignment_score": float(score_total / denom),
+        "mean_raw_joint_score": float(raw_joint_score_total / denom),
         "no_assignment_ratio": float(1.0 - (assigned / denom)),
+        "mean_assignment_time_sec": float(np.mean(assignment_times)) if assignment_times else 0.0,
+        "exact_chain_correct_mask": exact_mask,
         "by_family": by_family,
         "num_failures_saved": int(len(failures)),
         "failure_bucket_counts": dict(sorted(failure_buckets.items())),
@@ -541,6 +604,21 @@ def _truth_semantic_stats(items: list[BenchmarkItem]) -> dict[str, object]:
     }
 
 
+def _load_surrogate_for_scheme_d(args: argparse.Namespace):
+    with args.config_inverse.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    paths = dict(cfg.get("paths", {}))
+    src_dir = args.config_inverse.parent
+    if args.forward_model_path is not None:
+        model_path = Path(args.forward_model_path)
+    else:
+        model_path = _resolve_path(paths["forward_model"], base_dir=src_dir)
+    config_forward = _resolve_path(paths["config_forward"], base_dir=src_dir)
+    device = torch.device(args.device)
+    surrogate, _ = load_frozen_surrogate(str(model_path), str(config_forward), device)
+    return surrogate, device, dict(cfg.get("reward", {}))
+
+
 def main() -> None:
     args = _parse_args()
     mode_keys = [mode for mode in args.eval_modes if mode in MODE_SPECS]
@@ -572,6 +650,15 @@ def main() -> None:
     train_items = [_benchmark_item_from_sample(raw_samples[idx], idx) for idx in train_indices]
     test_items = [_benchmark_item_from_sample(raw_samples[idx], idx) for idx in test_indices]
 
+    if args.target_shuffle_mode == "within_family":
+        _shuffle_targets_within_family(test_items, seed=int(args.seed) + 42)
+
+    surrogate = None
+    surrogate_device = None
+    reward_cfg = {}
+    if "scheme_d" in scheme_names:
+        surrogate, surrogate_device, reward_cfg = _load_surrogate_for_scheme_d(args)
+
     summary = {
         "config": {
             "input_pkl": str(args.input_pkl),
@@ -588,6 +675,11 @@ def main() -> None:
             "eval_modes": mode_keys,
             "schemes": scheme_names,
             "max_candidates_cap": int(args.max_candidates_cap),
+            "scheme_d_structural_prior_weight": float(args.scheme_d_structural_prior_weight) if args.scheme_d_structural_prior_weight is not None else 0.05,
+            "scheme_d_top_k": int(args.scheme_d_top_k) if args.scheme_d_top_k is not None else 5,
+            "target_shuffle_mode": args.target_shuffle_mode,
+            "config_inverse": str(args.config_inverse),
+            "surrogate_device": str(surrogate_device) if surrogate_device is not None else None,
         },
         "dataset": {
             "raw_samples": len(raw_samples),
@@ -607,6 +699,16 @@ def main() -> None:
         scheme_a = RuleBasedReadoutAssignment()
         scheme_b = LearnedChainScorerReadoutAssignment()
         scheme_c = SlotPointerReadoutAssignment()
+        _spw = float(args.scheme_d_structural_prior_weight) if args.scheme_d_structural_prior_weight is not None else 0.05
+        _stk = int(args.scheme_d_top_k) if args.scheme_d_top_k is not None else 5
+        scheme_d = SurrogateTargetReadoutAssignment(
+            surrogate,
+            top_k=_stk,
+            batch_size=int(args.surrogate_batch_size),
+            metric_cfg=reward_cfg,
+            device=surrogate_device,
+            structural_prior_weight=_spw,
+        ) if surrogate is not None else None
 
         train_summary = {}
         if "scheme_b" in scheme_names:
@@ -638,6 +740,7 @@ def main() -> None:
             "scheme_a": scheme_a,
             "scheme_b": scheme_b,
             "scheme_c": scheme_c,
+            "scheme_d": scheme_d,
         }
         for scheme_name in scheme_names:
             module = modules[scheme_name]

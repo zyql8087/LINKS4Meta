@@ -16,10 +16,21 @@ FAMILY_INDEX_TO_NAME = {
     2: "8bar",
     3: "9bar",
 }
+CODEBOOK_VERSION = "geom_codebook_v2_validity_context_bucket"
+DEFAULT_FINE_BUCKET_POLICY = {
+    "enabled": True,
+    "complex_families": ["8bar", "9bar"],
+    "semantic_only": True,
+    "include_step_index": True,
+    "include_action_topo": True,
+    "include_topology_signature_when_available": False,
+}
 
 
 def family_name_from_index(family_index: int | None) -> str:
-    return FAMILY_INDEX_TO_NAME.get(int(family_index or -1), "unknown")
+    if family_index is None:
+        return "unknown"
+    return FAMILY_INDEX_TO_NAME.get(int(family_index), "unknown")
 
 
 def step_role_for_index(step_index: int, expected_j_steps: int) -> str:
@@ -28,18 +39,189 @@ def step_role_for_index(step_index: int, expected_j_steps: int) -> str:
     return "aux"
 
 
-def codebook_bucket_for_step(family_name: str, step_role: str) -> str:
+def _action_topo_suffix(action_topo) -> str | None:
+    if action_topo is None:
+        return None
+    if hasattr(action_topo, "detach"):
+        values = action_topo.detach().cpu().view(-1).tolist()
+    elif hasattr(action_topo, "tolist"):
+        values = action_topo.tolist()
+    else:
+        values = list(action_topo)
+    if len(values) < 3:
+        return None
+    return "_".join(str(int(value)) for value in values[:3])
+
+
+def _normalise_fine_bucket_policy(policy: dict | None) -> dict[str, object]:
+    merged = dict(DEFAULT_FINE_BUCKET_POLICY)
+    if policy:
+        merged.update(dict(policy))
+        if "complex_families" in policy:
+            merged["complex_families"] = [str(item) for item in policy["complex_families"]]
+    return merged
+
+
+def _normalise_bucket_code_overrides(overrides: dict | None) -> dict[str, int]:
+    normalised: dict[str, int] = {}
+    for key, value in dict(overrides or {}).items():
+        limit = int(value)
+        if limit <= 0:
+            continue
+        normalised[str(key)] = limit
+    return normalised
+
+
+def _max_codes_for_bucket(bucket: str, default_limit: int, overrides: dict[str, int]) -> int:
+    bucket = str(bucket)
+    if bucket in overrides:
+        return max(1, int(overrides[bucket]))
+    wildcard_matches = [
+        (len(pattern), limit)
+        for pattern, limit in overrides.items()
+        if pattern.endswith("*") and bucket.startswith(pattern[:-1])
+    ]
+    if wildcard_matches:
+        wildcard_matches.sort(reverse=True)
+        return max(1, int(wildcard_matches[0][1]))
+    return max(1, int(default_limit))
+
+
+def _bucket_token(value: object) -> str:
+    text = str(value).strip()
+    safe = []
+    for char in text:
+        if char.isalnum():
+            safe.append(char)
+        elif char in {"-", "_"}:
+            safe.append("_")
+    return "".join(safe).strip("_") or "unknown"
+
+
+def codebook_bucket_for_step(
+    family_name: str,
+    step_role: str,
+    *,
+    step_index: int | None = None,
+    action_topo=None,
+    topology_signature=None,
+    fine_topology_buckets: bool = False,
+    fine_bucket_policy: dict | None = None,
+) -> str:
     family_name = str(family_name)
     step_role = str(step_role)
     if step_role == "aux":
-        return "aux_shared"
+        policy = _normalise_fine_bucket_policy(fine_bucket_policy)
+        complex_families = set(str(item) for item in policy.get("complex_families", []))
+        use_fine = (
+            bool(fine_topology_buckets)
+            and bool(policy.get("enabled", True))
+            and family_name in complex_families
+            and not bool(policy.get("semantic_only", True))
+        )
+        if not use_fine:
+            return "aux_shared"
+        parts = [f"aux_{family_name}"]
+        if bool(policy.get("include_step_index", True)) and step_index is not None:
+            parts.append(f"step{int(step_index)}")
+        if (
+            bool(policy.get("include_topology_signature_when_available", False))
+            and topology_signature not in (None, "")
+        ):
+            parts.append(f"sig_{_bucket_token(topology_signature)}")
+        suffix = _action_topo_suffix(action_topo)
+        if bool(policy.get("include_action_topo", True)) and suffix is not None:
+            parts.append(f"topo_{suffix}")
+        if len(parts) == 1:
+            return "aux_shared"
+        return "_".join(parts)
     if family_name in {"6bar", "7bar"}:
         return "semantic_67"
-    if family_name == "8bar":
-        return "semantic_8bar"
-    if family_name == "9bar":
-        return "semantic_9bar"
+    if family_name in {"8bar", "9bar"}:
+        base = f"semantic_{family_name}"
+        policy = _normalise_fine_bucket_policy(fine_bucket_policy)
+        complex_families = set(str(item) for item in policy.get("complex_families", []))
+        use_fine = (
+            bool(fine_topology_buckets)
+            and bool(policy.get("enabled", True))
+            and family_name in complex_families
+            and (step_role == "semantic" or not bool(policy.get("semantic_only", True)))
+        )
+        if not use_fine:
+            return base
+        parts = [base]
+        if bool(policy.get("include_step_index", True)) and step_index is not None:
+            parts.append(f"step{int(step_index)}")
+        if (
+            bool(policy.get("include_topology_signature_when_available", False))
+            and topology_signature not in (None, "")
+        ):
+            parts.append(f"sig_{_bucket_token(topology_signature)}")
+        suffix = _action_topo_suffix(action_topo)
+        if bool(policy.get("include_action_topo", True)) and suffix is not None:
+            parts.append(f"topo_{suffix}")
+        if len(parts) == 1:
+            return base
+        return "_".join(parts)
     return f"{step_role}_{family_name}"
+
+
+def codebook_bucket_candidates_for_step(
+    family_name: str,
+    step_role: str,
+    *,
+    step_index: int | None = None,
+    action_topo=None,
+    topology_signature=None,
+    fine_topology_buckets: bool = True,
+    fine_bucket_policy: dict | None = None,
+) -> list[str]:
+    base = codebook_bucket_for_step(family_name, step_role)
+    if not fine_topology_buckets:
+        return [base]
+    fine = codebook_bucket_for_step(
+        family_name,
+        step_role,
+        step_index=step_index,
+        action_topo=action_topo,
+        topology_signature=topology_signature,
+        fine_topology_buckets=True,
+        fine_bucket_policy=fine_bucket_policy,
+    )
+    topo_only = codebook_bucket_for_step(
+        family_name,
+        step_role,
+        action_topo=action_topo,
+        fine_topology_buckets=True,
+        fine_bucket_policy={**_normalise_fine_bucket_policy(fine_bucket_policy), "include_step_index": False},
+    )
+    legacy = "aux_shared" if str(step_role) == "aux" else base
+    return list(dict.fromkeys([fine, topo_only, base, legacy]))
+
+
+def resolve_codebook_bucket_for_step(
+    bucket_map: dict[str, object],
+    family_name: str,
+    step_role: str,
+    *,
+    step_index: int | None = None,
+    action_topo=None,
+    topology_signature=None,
+    fine_topology_buckets: bool = True,
+    fine_bucket_policy: dict | None = None,
+) -> str:
+    for bucket in codebook_bucket_candidates_for_step(
+        family_name,
+        step_role,
+        step_index=step_index,
+        action_topo=action_topo,
+        topology_signature=topology_signature,
+        fine_topology_buckets=fine_topology_buckets,
+        fine_bucket_policy=fine_bucket_policy,
+    ):
+        if bucket in bucket_map:
+            return bucket
+    return codebook_bucket_for_step(family_name, step_role)
 
 
 def default_action_codebook_path(dataset_path: str | Path) -> str:
@@ -58,9 +240,9 @@ def _family_scope_for_bucket(bucket: str) -> tuple[list[str], str]:
         return list(FAMILY_INDEX_TO_NAME.values()), "aux"
     if bucket == "semantic_67":
         return ["6bar", "7bar"], "semantic"
-    if bucket == "semantic_8bar":
+    if bucket == "semantic_8bar" or bucket.startswith("semantic_8bar_"):
         return ["8bar"], "semantic"
-    if bucket == "semantic_9bar":
+    if bucket == "semantic_9bar" or bucket.startswith("semantic_9bar_"):
         return ["9bar"], "semantic"
     parts = bucket.split("_", maxsplit=1)
     if len(parts) == 2:
@@ -175,12 +357,154 @@ def decode_local_dyad_code(
     return n1.astype(np.float32), n2.astype(np.float32)
 
 
+def _cluster_medoid(members: Sequence[tuple[int, np.ndarray]]) -> np.ndarray:
+    return _cluster_medoid_member(members)[1].copy()
+
+
+def _cluster_medoid_member(members: Sequence[tuple[int, np.ndarray]]) -> tuple[int, np.ndarray]:
+    if not members:
+        raise ValueError("cannot choose medoid from empty cluster")
+    vectors = [np.asarray(vector, dtype=np.float32) for _, vector in members]
+    if len(vectors) == 1:
+        return int(members[0][0]), vectors[0].copy()
+    stacked = np.stack(vectors, axis=0)
+    distances = np.linalg.norm(stacked[:, None, :] - stacked[None, :, :], axis=-1).sum(axis=1)
+    medoid_idx = int(np.argmin(distances))
+    return int(members[medoid_idx][0]), vectors[medoid_idx].copy()
+
+
+def _evenly_spaced_members(
+    members: Sequence[tuple[int, np.ndarray]],
+    max_items: int,
+) -> list[tuple[int, np.ndarray]]:
+    if len(members) <= max_items:
+        return list(members)
+    if max_items <= 1:
+        return [members[0]]
+    indices = np.linspace(0, len(members) - 1, num=int(max_items), dtype=int).tolist()
+    return [members[int(idx)] for idx in dict.fromkeys(indices)]
+
+
+def _vector_valid_for_step(vector: np.ndarray, step: dict[str, object], constraint_cfg: dict | None) -> bool:
+    try:
+        from src.inverse.rl_env import apply_j_operator, validate_graph_structure
+
+        graph = step["base_data"]
+        topo = step["action_topo"]
+        if hasattr(topo, "detach"):
+            u, v, w = [int(value) for value in topo.detach().cpu().view(-1).tolist()[:3]]
+        else:
+            u, v, w = [int(value) for value in list(topo)[:3]]
+        n1, n2 = decode_local_dyad_code(
+            graph.pos[u].detach().cpu().numpy(),
+            graph.pos[v].detach().cpu().numpy(),
+            graph.pos[w].detach().cpu().numpy(),
+            vector,
+        )
+        next_graph = apply_j_operator(graph, u, v, w, n1, n2)
+        is_valid, _ = validate_graph_structure(next_graph, constraint_cfg or {})
+        return bool(is_valid)
+    except Exception:
+        return False
+
+
+def _choose_cluster_representative_info(
+    members: Sequence[tuple[int, np.ndarray]],
+    step_paths: Sequence[dict[str, object]],
+    *,
+    strategy: str,
+    constraint_cfg: dict | None,
+    max_validation_candidates: int,
+    max_validation_contexts: int,
+) -> dict[str, object]:
+    if not members:
+        raise ValueError("cannot choose representative from empty cluster")
+    strategy = str(strategy or "validity_best_medoid")
+    if strategy == "mean":
+        vector = np.mean([np.asarray(vector, dtype=np.float32) for _, vector in members], axis=0).astype(np.float32)
+        return {
+            "vector": vector,
+            "representative_item_idx": None,
+            "validity_pass_count": 0,
+            "validity_context_count": 0,
+        }
+
+    if not all("base_data" in step_paths[item_idx] and "action_topo" in step_paths[item_idx] for item_idx, _ in members):
+        item_idx, vector = _cluster_medoid_member(members)
+        return {
+            "vector": vector,
+            "representative_item_idx": int(item_idx),
+            "validity_pass_count": 0,
+            "validity_context_count": 0,
+        }
+
+    validation_members = _evenly_spaced_members(list(members), max(1, int(max_validation_contexts)))
+    candidate_members = _evenly_spaced_members(list(members), max(1, int(max_validation_candidates)))
+    member_vectors = [np.asarray(vector, dtype=np.float32) for _, vector in members]
+    best_key = None
+    best_vector = None
+    best_item_idx = None
+    best_valid_count = 0
+    for candidate_idx, (candidate_item_idx, candidate_vector) in enumerate(candidate_members):
+        candidate_vector = np.asarray(candidate_vector, dtype=np.float32)
+        valid_count = sum(
+            int(_vector_valid_for_step(candidate_vector, step_paths[item_idx], constraint_cfg))
+            for item_idx, _ in validation_members
+        )
+        distance_sum = float(sum(np.linalg.norm(candidate_vector - vector) for vector in member_vectors))
+        key = (valid_count, -distance_sum, -candidate_idx)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_vector = candidate_vector
+            best_item_idx = int(candidate_item_idx)
+            best_valid_count = int(valid_count)
+    if best_vector is None:
+        best_item_idx, best_vector = _cluster_medoid_member(members)
+        best_valid_count = 0
+    return {
+        "vector": np.asarray(best_vector, dtype=np.float32).copy(),
+        "representative_item_idx": int(best_item_idx) if best_item_idx is not None else None,
+        "validity_pass_count": int(best_valid_count),
+        "validity_context_count": int(len(validation_members)),
+    }
+
+
+def _choose_cluster_representative(
+    members: Sequence[tuple[int, np.ndarray]],
+    step_paths: Sequence[dict[str, object]],
+    *,
+    strategy: str,
+    constraint_cfg: dict | None,
+    max_validation_candidates: int,
+    max_validation_contexts: int,
+) -> np.ndarray:
+    return np.asarray(
+        _choose_cluster_representative_info(
+            members,
+            step_paths,
+            strategy=strategy,
+            constraint_cfg=constraint_cfg,
+            max_validation_candidates=max_validation_candidates,
+            max_validation_contexts=max_validation_contexts,
+        )["vector"],
+        dtype=np.float32,
+    ).copy()
+
+
 def build_action_codebook(
     step_paths: Sequence[dict[str, object]],
     *,
     cluster_radius: float = 0.075,
     max_codes_per_bucket: int = 24,
+    max_codes_per_bucket_overrides: dict | None = None,
+    representative_strategy: str = "validity_best_medoid",
+    constraint_cfg: dict | None = None,
+    max_validation_candidates: int = 32,
+    max_validation_contexts: int = 96,
+    fine_bucket_policy: dict | None = None,
 ) -> dict[str, object]:
+    fine_bucket_policy = _normalise_fine_bucket_policy(fine_bucket_policy)
+    bucket_limit_overrides = _normalise_bucket_code_overrides(max_codes_per_bucket_overrides)
     grouped: dict[str, list[tuple[int, np.ndarray]]] = defaultdict(list)
     for item_idx, item in enumerate(step_paths):
         grouped[str(item["action_code_bucket"])].append((item_idx, np.asarray(item["action_code_vec"], dtype=np.float32)))
@@ -194,7 +518,7 @@ def build_action_codebook(
         clusters: list[dict[str, object]] = []
         for item_idx, vector in samples:
             if not clusters:
-                clusters.append({"center": vector.copy(), "count": 1})
+                clusters.append({"center": vector.copy(), "count": 1, "members": [(item_idx, vector.copy())]})
                 continue
             distances = [float(np.linalg.norm(vector - cluster["center"])) for cluster in clusters]
             best_idx = int(np.argmin(distances))
@@ -204,27 +528,46 @@ def build_action_codebook(
                 cluster["center"] = ((cluster["center"] * count) + vector) / float(count + 1)
                 cluster["center"] = np.asarray(cluster["center"], dtype=np.float32)
                 cluster["count"] = count + 1
+                cluster["members"].append((item_idx, vector.copy()))
             else:
-                clusters.append({"center": vector.copy(), "count": 1})
+                clusters.append({"center": vector.copy(), "count": 1, "members": [(item_idx, vector.copy())]})
 
         raw_cluster_count = len(clusters)
         clusters.sort(key=lambda cluster: int(cluster["count"]), reverse=True)
-        clusters = clusters[: max(1, int(max_codes_per_bucket))]
+        bucket_limit = _max_codes_for_bucket(bucket, int(max_codes_per_bucket), bucket_limit_overrides)
+        clusters = clusters[:bucket_limit]
         bucket_ids: list[int] = []
-        bucket_centers = [np.asarray(cluster["center"], dtype=np.float32) for cluster in clusters]
+        representative_infos = [
+            _choose_cluster_representative_info(
+                cluster["members"],
+                step_paths,
+                strategy=representative_strategy,
+                constraint_cfg=constraint_cfg,
+                max_validation_candidates=max_validation_candidates,
+                max_validation_contexts=max_validation_contexts,
+            )
+            for cluster in clusters
+        ]
+        bucket_centers = [np.asarray(info["vector"], dtype=np.float32) for info in representative_infos]
         print(
             f"[*] Bucket '{bucket}' clustering complete: raw_clusters={raw_cluster_count}, "
-            f"kept={len(clusters)}"
+            f"kept={len(clusters)}, limit={bucket_limit}"
         )
 
-        for cluster in clusters:
+        for cluster, info in zip(clusters, representative_infos):
+            representative = np.asarray(info["vector"], dtype=np.float32)
             global_id = len(entries)
             entries.append(
                 {
                     "id": global_id,
                     "bucket": bucket,
-                    "vector": np.asarray(cluster["center"], dtype=np.float32).tolist(),
+                    "vector": np.asarray(representative, dtype=np.float32).tolist(),
                     "count": int(cluster["count"]),
+                    "representative_item_idx": (
+                        None if info["representative_item_idx"] is None else int(info["representative_item_idx"])
+                    ),
+                    "validity_pass_count": int(info["validity_pass_count"]),
+                    "validity_context_count": int(info["validity_context_count"]),
                 }
             )
             bucket_ids.append(global_id)
@@ -236,10 +579,16 @@ def build_action_codebook(
             item_assignments[item_idx] = bucket_ids[bucket_local_id]
 
     return {
+        "version": CODEBOOK_VERSION,
         "strategy": "strategy_a_local_ratio_dyad_v1",
         "code_dim": 6,
         "cluster_radius": float(cluster_radius),
         "max_codes_per_bucket": int(max_codes_per_bucket),
+        "max_codes_per_bucket_overrides": dict(sorted(bucket_limit_overrides.items())),
+        "representative_strategy": str(representative_strategy),
+        "max_validation_candidates": int(max_validation_candidates),
+        "max_validation_contexts": int(max_validation_contexts),
+        "fine_bucket_policy": fine_bucket_policy,
         "entries": entries,
         "bucket_to_ids": bucket_to_ids,
         "item_assignments": item_assignments,
@@ -271,11 +620,16 @@ def load_action_codebook(dataset_path: str | Path) -> dict[str, object]:
     return torch.load(default_action_codebook_path(dataset_path), map_location="cpu", weights_only=False)
 
 
-def save_action_codebook(dataset_path: str | Path, codebook: dict[str, object]) -> str:
+def save_action_codebook(
+    dataset_path: str | Path,
+    codebook: dict[str, object],
+    *,
+    step_paths: Sequence[dict[str, object]] | None = None,
+) -> str:
     output_path = default_action_codebook_path(dataset_path)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(codebook, output_path)
-    export_action_codebook_v1_json(dataset_path, codebook)
+    export_action_codebook_v1_json(dataset_path, codebook, step_paths=step_paths)
     return output_path
 
 
@@ -332,16 +686,28 @@ def export_action_codebook_v1_json(
                 "family_scope": families,
                 "vector": [float(value) for value in entry["vector"]],
                 "count": int(entry.get("count", 0)),
+                "representative_item_idx": (
+                    None
+                    if entry.get("representative_item_idx") is None
+                    else int(entry.get("representative_item_idx"))
+                ),
+                "validity_pass_count": int(entry.get("validity_pass_count", 0)),
+                "validity_context_count": int(entry.get("validity_context_count", 0)),
             }
         )
 
     payload = {
-        "version": "geom_codebook_v1",
+        "version": str(codebook.get("version", "geom_codebook_v1")),
         "strategy": str(codebook.get("strategy", "strategy_a_local_ratio_dyad_v1")),
         "parameterization": "rho_rho_tau_gamma_sigma_sigma",
         "code_dim": int(codebook.get("code_dim", 6)),
         "cluster_radius": float(codebook.get("cluster_radius", 0.0)),
         "max_codes_per_bucket": int(codebook.get("max_codes_per_bucket", 0)),
+        "max_codes_per_bucket_overrides": dict(codebook.get("max_codes_per_bucket_overrides", {})),
+        "representative_strategy": str(codebook.get("representative_strategy", "unknown")),
+        "max_validation_candidates": int(codebook.get("max_validation_candidates", 0)),
+        "max_validation_contexts": int(codebook.get("max_validation_contexts", 0)),
+        "fine_bucket_policy": dict(codebook.get("fine_bucket_policy", {})),
         "source_dataset": str(Path(dataset_path)),
         "buckets": buckets_payload,
         "codes": codes_payload,
@@ -358,8 +724,19 @@ def allowed_code_ids_for_context(
     *,
     family_name: str,
     step_role: str,
+    step_index: int | None = None,
+    action_topo=None,
+    topology_signature=None,
 ) -> list[int]:
-    bucket = codebook_bucket_for_step(family_name, step_role)
+    bucket = resolve_codebook_bucket_for_step(
+        codebook.get("bucket_to_ids", {}),
+        family_name,
+        step_role,
+        step_index=step_index,
+        action_topo=action_topo,
+        topology_signature=topology_signature,
+        fine_bucket_policy=codebook.get("fine_bucket_policy", {}),
+    )
     return [int(idx) for idx in codebook.get("bucket_to_ids", {}).get(bucket, [])]
 
 

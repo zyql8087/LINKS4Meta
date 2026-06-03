@@ -46,6 +46,8 @@ def run_training(
     *,
     output_dir: Path,
     device: str,
+    init_model_path: Path | None = None,
+    epochs_override: int | None = None,
 ) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -70,6 +72,12 @@ def run_training(
     val_loader = PreCachedLoader(val_loader_orig, device, desc="Caching Val", shuffle=False)
 
     model = BioKinematicsGNN(config_model).to(device)
+    if init_model_path is not None:
+        init_state = torch.load(init_model_path, map_location=device, weights_only=False)
+        if isinstance(init_state, dict) and "model_state_dict" in init_state:
+            init_state = init_state["model_state_dict"]
+        model.load_state_dict(init_state, strict=True)
+        print(f"Warm-started forward model from '{init_model_path}'.")
     optimizer = torch.optim.Adam(model.parameters(), lr=config_model["training"]["learning_rate"])
 
     print(f"Model Initialized. Params: {sum(p.numel() for p in model.parameters())}")
@@ -81,7 +89,8 @@ def run_training(
 
     best_val_loss = float("inf")
     best_val_metrics = {}
-    for epoch in range(config_model["training"]["epochs"]):
+    num_epochs = int(epochs_override if epochs_override is not None else config_model["training"]["epochs"])
+    for epoch in range(num_epochs):
         train_loss = train_epoch(model, train_loader, optimizer, config_model["training"], device)
         val_loss, val_metrics = eval_epoch(model, val_loader, config_model["training"], device)
 
@@ -147,6 +156,8 @@ def main() -> None:
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
+    parser.add_argument("--init_model", type=str, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
     args = parser.parse_args()
 
     config_model, config_model_path = load_yaml_config(args.config_model, SCRIPT_DIR, WORKSPACE_ROOT)
@@ -163,7 +174,19 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     if not output_dir.is_absolute():
         output_dir = (WORKSPACE_ROOT / output_dir).resolve()
-    run_training(config_model, config_data, output_dir=output_dir, device=args.device)
+    init_model_path = None
+    if args.init_model:
+        init_model_path = Path(args.init_model)
+        if not init_model_path.is_absolute():
+            init_model_path = resolve_path(str(init_model_path), config_model_path.parent, WORKSPACE_ROOT)
+    run_training(
+        config_model,
+        config_data,
+        output_dir=output_dir,
+        device=args.device,
+        init_model_path=init_model_path,
+        epochs_override=args.epochs,
+    )
 
 
 if __name__ == "__main__":

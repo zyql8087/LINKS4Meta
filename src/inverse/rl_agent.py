@@ -11,9 +11,9 @@ from torch_geometric.data import Batch, Data
 from torch_geometric.utils import scatter
 
 from src.inverse.action_codebook import (
-    codebook_bucket_for_step,
     decode_local_dyad_code,
     family_name_from_index,
+    resolve_codebook_bucket_for_step,
     step_role_for_index,
 )
 
@@ -124,6 +124,21 @@ class PPOAgent:
             + list(self.critic.parameters())
         )
         self.buffer = PPOBuffer()
+
+    @staticmethod
+    def _sample_order_from_probabilities(probabilities: np.ndarray) -> List[int]:
+        probs = np.asarray(probabilities, dtype=np.float64).reshape(-1)
+        if probs.size == 0:
+            return []
+        probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        probs = np.maximum(probs, 0.0)
+        total = float(probs.sum())
+        if not np.isfinite(total) or total <= 0.0:
+            probs = np.full(probs.shape, 1.0 / float(probs.size), dtype=np.float64)
+        else:
+            probs = probs / total
+            probs = probs / float(probs.sum())
+        return list(np.random.choice(len(probs), size=len(probs), replace=False, p=probs))
 
     def _enumerate_topologies(self, graph: Data):
         x_np = graph.x.detach().cpu().numpy()
@@ -249,7 +264,13 @@ class PPOAgent:
     ) -> tuple[list[int], np.ndarray]:
         family_name = family_name_from_index(family_index)
         step_role = step_role_for_index(step_index, expected_j_steps)
-        bucket = codebook_bucket_for_step(family_name, step_role)
+        bucket = resolve_codebook_bucket_for_step(
+            self.policy.action_codebook_buckets,
+            family_name,
+            step_role,
+            step_index=int(step_index),
+            action_topo=action_topo,
+        )
         allowed_ids = list(self.policy.action_codebook_buckets.get(bucket, []))
         if not allowed_ids:
             allowed_ids = list(range(int(self.policy.action_codebook.size(0))))
@@ -300,7 +321,7 @@ class PPOAgent:
         if deterministic:
             candidate_order = list(np.argsort(topo_probs)[::-1])
         else:
-            candidate_order = list(np.random.choice(len(topologies), size=len(topologies), replace=False, p=topo_probs))
+            candidate_order = self._sample_order_from_probabilities(topo_probs)
 
         family_index = int((context or {}).get('family_index', self.policy.num_families))
         step_index = int((context or {}).get('step_index', 0))
@@ -329,7 +350,7 @@ class PPOAgent:
             if deterministic:
                 code_order = list(np.argsort(code_probs)[::-1])
             else:
-                code_order = list(np.random.choice(len(allowed_code_ids), size=len(allowed_code_ids), replace=False, p=code_probs))
+                code_order = self._sample_order_from_probabilities(code_probs)
 
             for code_local_idx in code_order:
                 diagnostics['sampled_codes'] += 1

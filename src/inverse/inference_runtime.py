@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 
@@ -199,6 +200,90 @@ def load_inverse_bundle(
         "geometry_code_issue": geometry_code_status["issue"],
         "geometry_code_status": geometry_code_status,
     }
+
+
+def load_rollout_bundle_with_fallback(
+    cfg: dict,
+    device,
+    *,
+    preferred_model_type: str = "rl",
+    allow_fresh_fallback: bool,
+    require_geometry_code_ready: bool = False,
+    candidate_order: Optional[Sequence[str]] = None,
+) -> Optional[dict]:
+    requested = str(preferred_model_type).strip().lower()
+    ordered_candidates = list(candidate_order or (requested, "il", "rl"))
+    order = []
+    for item in ordered_candidates:
+        name = str(item).strip().lower()
+        if name in {"il", "rl"} and name not in order:
+            order.append(name)
+
+    paths_cfg = cfg.get("paths", {})
+    bundle_candidates = {}
+    first_bundle = None
+    selected_bundle = None
+    selected_name = None
+
+    for model_type in order:
+        ckpt_path = paths_cfg.get(f"{model_type}_model_output")
+        if not ckpt_path:
+            bundle_candidates[model_type] = {
+                "checkpoint_path": None,
+                "checkpoint_loaded": False,
+                "geometry_code_ready": False,
+                "geometry_code_issue": f"missing config path for {model_type}_model_output",
+                "geometry_code_status": None,
+            }
+            continue
+        bundle = load_inverse_bundle(
+            cfg,
+            ckpt_path,
+            device,
+            allow_fresh_fallback=allow_fresh_fallback,
+            require_geometry_code_ready=False,
+        )
+        if bundle is None:
+            bundle_candidates[model_type] = {
+                "checkpoint_path": ckpt_path,
+                "checkpoint_loaded": False,
+                "geometry_code_ready": False,
+                "geometry_code_issue": f"failed to load inverse bundle from '{ckpt_path}'",
+                "geometry_code_status": None,
+            }
+            continue
+        bundle_candidates[model_type] = {
+            "checkpoint_path": bundle.get("checkpoint_path"),
+            "checkpoint_loaded": bool(bundle.get("checkpoint_loaded")),
+            "checkpoint_warning": bundle.get("checkpoint_warning"),
+            "geometry_code_ready": bool(bundle.get("geometry_code_ready", True)),
+            "geometry_code_issue": bundle.get("geometry_code_issue"),
+            "geometry_code_status": bundle.get("geometry_code_status"),
+        }
+        if first_bundle is None:
+            first_bundle = (model_type, bundle)
+        if selected_bundle is None and bool(bundle.get("checkpoint_loaded")) and bool(bundle.get("geometry_code_ready", True)):
+            selected_bundle = bundle
+            selected_name = model_type
+            break
+
+    if selected_bundle is None and first_bundle is not None:
+        selected_name, selected_bundle = first_bundle
+    if selected_bundle is None:
+        return None
+
+    if require_geometry_code_ready and not bool(selected_bundle.get("geometry_code_ready", True)):
+        raise RuntimeError(
+            f"No rollout-ready inverse bundle available for preferred='{requested}'. "
+            f"Tried={order}, issue={selected_bundle.get('geometry_code_issue')}"
+        )
+
+    selected = copy.copy(selected_bundle)
+    selected["selected_model_type"] = selected_name
+    selected["requested_model_type"] = requested
+    selected["fallback_used"] = bool(selected_name is not None and selected_name != requested)
+    selected["bundle_candidates"] = bundle_candidates
+    return selected
 
 
 def encode_target(curve_encoder, target: dict, device):

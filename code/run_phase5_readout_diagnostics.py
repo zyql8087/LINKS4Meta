@@ -16,10 +16,10 @@ if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
 from src.config_utils import ensure_parent_dir, load_yaml_config, resolve_mapping_paths
-from src.inverse.inference_runtime import encode_target, load_inverse_bundle
+from src.inverse.inference_runtime import encode_target, load_rollout_bundle_with_fallback
 from src.inverse.phase4_il import _build_step_base_graph, _curve_tensor, family_name_to_index
 from src.inverse.rl_env import apply_j_operator
-from src.inverse.readout_assignment import RuleBasedReadoutAssignment
+from src.inverse.readout_assignment import RuleBasedReadoutAssignment, SurrogateTargetReadoutAssignment
 from src.inverse.rl_env import (
     MechanismEnv,
     _infer_semantic_masks,
@@ -221,12 +221,20 @@ def _strip_cached_semantics(graph):
     return stripped
 
 
-def _masks_payload(graph, *, target: Optional[dict], motion, strip_cached_semantics: bool = False) -> dict:
+def _masks_payload(
+    graph,
+    *,
+    target: Optional[dict],
+    motion,
+    strip_cached_semantics: bool = False,
+    readout_assigner=None,
+) -> dict:
     graph_input = _strip_cached_semantics(graph) if strip_cached_semantics else graph
     mask_hip, mask_knee, mask_ankle, mask_foot = _infer_semantic_masks(
         graph_input,
         target=target,
         motion=motion,
+        readout_assigner=readout_assigner,
     )
     return {
         "hip": _mask_indices(mask_hip),
@@ -383,6 +391,7 @@ def main() -> None:
             "config_forward",
             "il_dataset_output",
             "il_multistep_dataset_output",
+            "il_model_output",
             "il_split_output",
             "rl_model_output",
         ),
@@ -418,11 +427,17 @@ def main() -> None:
     except Exception as exc:
         surrogate = None
         surrogate_load_error = f"{type(exc).__name__}: {exc}"
-    bundle = load_inverse_bundle(cfg, cfg["paths"]["rl_model_output"], device, allow_fresh_fallback=False)
+    bundle = load_rollout_bundle_with_fallback(
+        cfg,
+        device,
+        preferred_model_type="rl",
+        allow_fresh_fallback=False,
+        require_geometry_code_ready=False,
+    )
     if bundle is None or not bool(bundle.get("checkpoint_loaded")):
-        raise RuntimeError(f"Failed to load RL checkpoint from '{cfg['paths']['rl_model_output']}'")
+        raise RuntimeError("Failed to load inverse rollout bundle for preferred='rl'")
 
-    assigner = RuleBasedReadoutAssignment(top_k=3)
+    rule_assigner = RuleBasedReadoutAssignment(top_k=3)
     reward_cfg = dict(cfg.get("reward", {}))
     constraint_cfg = dict(cfg.get("constraints", {}))
     env_max_steps = int(cfg.get("rl_training", {}).get("steps_per_episode", 3))
@@ -459,8 +474,27 @@ def main() -> None:
         family_index = int(trace["family_index"])
 
         expert_graph = _reconstruct_expert_final_graph(trace)
-        expert_canonical = assigner.assign(expert_graph, target=target, motion=motion)
-        expert_deploy = assigner.assign(expert_graph, target=target, motion=None)
+        surrogate_assigner = (
+            SurrogateTargetReadoutAssignment(
+                surrogate,
+                top_k=3,
+                batch_size=64,
+                metric_cfg=reward_cfg,
+                device=device,
+                family_index=family_index,
+                step_index=expected_j_steps,
+                expected_j_steps=expected_j_steps,
+            )
+            if surrogate is not None
+            else None
+        )
+        expert_canonical = rule_assigner.assign(expert_graph, target=target, motion=motion)
+        expert_deploy_rule = rule_assigner.assign(expert_graph, target=target, motion=None)
+        expert_deploy = (
+            surrogate_assigner.assign(expert_graph, target=target, motion=None)
+            if surrogate_assigner is not None
+            else expert_deploy_rule
+        )
         expert_reward = None
         if surrogate is not None:
             expert_reward = _terminal_reward_payload(
@@ -489,7 +523,12 @@ def main() -> None:
         action_log, graph_snapshots, rollout_rewards, rollout_payloads = _policy_rollout_trace(bundle, trace, env)
         rollout_final_graph = graph_snapshots[-1]["graph"] if graph_snapshots else trace["base_data"]
         rollout_structure = _structure_payload(rollout_final_graph, constraint_cfg=constraint_cfg)
-        rollout_assignment = assigner.assign(rollout_final_graph, target=target, motion=None)
+        rollout_rule_assignment = rule_assigner.assign(rollout_final_graph, target=target, motion=None)
+        rollout_assignment = (
+            surrogate_assigner.assign(rollout_final_graph, target=target, motion=None)
+            if surrogate_assigner is not None
+            else rollout_rule_assignment
+        )
         rollout_reward = None
         rollout_reward_margin = None
         if rollout_payloads and rollout_rewards:
@@ -532,6 +571,8 @@ def main() -> None:
                 "expert": {
                     "structure": _structure_payload(expert_graph, constraint_cfg=constraint_cfg),
                     "canonical_assignment": _assignment_payload(expert_canonical),
+                    "deploy_rule_assignment": _assignment_payload(expert_deploy_rule),
+                    "deploy_surrogate_target_assignment": _assignment_payload(expert_deploy),
                     "deploy_assignment": _assignment_payload(expert_deploy),
                     "canonical_masks": _masks_payload(
                         expert_graph,
@@ -544,6 +585,7 @@ def main() -> None:
                         target=target,
                         motion=None,
                         strip_cached_semantics=True,
+                        readout_assigner=surrogate_assigner,
                     ),
                     "canonical_matches_truth": expert_canonical_matches_truth,
                     "deploy_matches_truth": expert_deploy_matches_truth,
@@ -554,12 +596,14 @@ def main() -> None:
                     "actions": action_log,
                     "num_events": len(graph_snapshots),
                     "structure": rollout_structure,
+                    "rule_final_assignment": _assignment_payload(rollout_rule_assignment),
                     "final_assignment": _assignment_payload(rollout_assignment),
                     "final_masks": _masks_payload(
                         rollout_final_graph,
                         target=target,
                         motion=None,
                         strip_cached_semantics=True,
+                        readout_assigner=surrogate_assigner,
                     ),
                     "reward_events": [
                         {
@@ -616,12 +660,16 @@ def main() -> None:
             "families": [str(item) for item in args.families],
             "seed": int(args.seed),
             "device": str(device),
+            "requested_model_type": str(bundle.get("requested_model_type")),
+            "selected_model_type": str(bundle.get("selected_model_type")),
+            "fallback_used": bool(bundle.get("fallback_used", False)),
             "rl_checkpoint": str(bundle.get("checkpoint_path")),
             "rl_checkpoint_loaded": bool(bundle.get("checkpoint_loaded")),
             "rl_checkpoint_warning": bundle.get("checkpoint_warning"),
             "rl_geometry_code_ready": bool(bundle.get("geometry_code_ready", True)),
             "rl_geometry_code_issue": bundle.get("geometry_code_issue"),
             "rl_geometry_code_status": bundle.get("geometry_code_status"),
+            "rollout_bundle_candidates": bundle.get("bundle_candidates"),
             "surrogate_checkpoint": str(cfg["paths"]["forward_model"]),
             "surrogate_load_error": surrogate_load_error,
             "split_source": "official_precomputed_split",

@@ -372,9 +372,10 @@ class GNNPolicy(nn.Module):
         *,
         family_ids: torch.Tensor | None = None,
         step_roles: torch.Tensor | None = None,
+        step_indices: torch.Tensor | None = None,
         bucket_map: dict[str, list[int]] | None = None,
     ) -> torch.Tensor:
-        from src.inverse.action_codebook import codebook_bucket_for_step, family_name_from_index
+        from src.inverse.action_codebook import family_name_from_index, resolve_codebook_bucket_for_step
 
         logits = self.geometry_code_logits(data, x_enc, graph_context, action_topo)
         if family_ids is None or step_roles is None:
@@ -385,7 +386,14 @@ class GNNPolicy(nn.Module):
         for row_idx in range(masked.size(0)):
             family_name = family_name_from_index(int(family_ids[row_idx].item()))
             step_role = "semantic" if int(step_roles[row_idx].item()) == 1 else "aux"
-            allowed_ids = allowed_map.get(codebook_bucket_for_step(family_name, step_role), [])
+            bucket = resolve_codebook_bucket_for_step(
+                allowed_map,
+                family_name,
+                step_role,
+                step_index=int(step_indices[row_idx].item()) if step_indices is not None else None,
+                action_topo=action_topo[row_idx],
+            )
+            allowed_ids = allowed_map.get(bucket, [])
             if allowed_ids:
                 invalid = torch.ones(masked.size(1), dtype=torch.bool, device=masked.device)
                 invalid[torch.tensor(allowed_ids, dtype=torch.long, device=masked.device)] = False

@@ -19,7 +19,7 @@ from src.config_utils import load_yaml_config, resolve_mapping_paths
 from src.inverse.inference_runtime import (
     demo_root_from_workspace,
     encode_target,
-    load_inverse_bundle,
+    load_rollout_bundle_with_fallback,
     rollout_trace_with_mcts,
 )
 from src.inverse.phase4_il import ensure_multistep_expert_paths
@@ -94,22 +94,26 @@ def main():
         output_dir = (WORKSPACE_ROOT / output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    weight_path = cfg["paths"]["rl_model_output"] if args.model_type == "rl" else cfg["paths"]["il_model_output"]
-    if not os.path.exists(weight_path):
-        print(f"[Warning] Weights '{weight_path}' not found. Falling back to IL weights.")
-        weight_path = cfg["paths"]["il_model_output"]
-    if not os.path.exists(weight_path):
-        print("[Error] No model weights found.")
-        return
-
-    bundle = load_inverse_bundle(cfg, weight_path, device, allow_fresh_fallback=False)
+    bundle = load_rollout_bundle_with_fallback(
+        cfg,
+        device,
+        preferred_model_type=args.model_type,
+        allow_fresh_fallback=False,
+        require_geometry_code_ready=False,
+    )
     if bundle is None:
-        print(f"[Error] Failed to load inverse bundle from '{weight_path}'")
+        print(f"[Error] Failed to load inverse rollout bundle for preferred='{args.model_type}'")
         return
     if not bool(bundle.get("geometry_code_ready", True)):
         print(f"[Error] Inverse bundle is not rollout-ready: {bundle.get('geometry_code_issue')}")
         return
-    print(f"[Inference] Loaded `{args.model_type}` weights from '{weight_path}'")
+    if bool(bundle.get("fallback_used", False)):
+        print(
+            f"[Inference] requested `{args.model_type}` weights but fell back to "
+            f"`{bundle.get('selected_model_type')}` from '{bundle.get('checkpoint_path')}'"
+        )
+    else:
+        print(f"[Inference] Loaded `{bundle.get('selected_model_type')}` weights from '{bundle.get('checkpoint_path')}'")
 
     surrogate, _ = load_frozen_surrogate(cfg["paths"]["forward_model"], cfg["paths"]["config_forward"], device)
     step_paths = ensure_multistep_expert_paths(
