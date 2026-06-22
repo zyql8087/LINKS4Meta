@@ -6,7 +6,7 @@ import unittest
 import torch
 from torch_geometric.data import Data
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from src.inverse.readout_assignment import (
     LearnedChainScorerReadoutAssignment,

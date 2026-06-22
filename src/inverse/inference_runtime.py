@@ -1,3 +1,8 @@
+"""
+推理运行时模块。
+提供模型加载、检查点诊断、IL/RL 回退选择和 rollout 推理执行。
+"""
+
 from __future__ import annotations
 
 import copy
@@ -16,6 +21,7 @@ from src.inverse.rl_env import apply_j_operator
 
 
 def demo_root_from_workspace(workspace_root: Path) -> Path:
+    """从工作空间根目录推导同级的 demo 目录路径。"""
     return (workspace_root.parent / "demo").resolve()
 
 
@@ -27,13 +33,17 @@ def inspect_inverse_checkpoint_geometry_code_state(
     action_codebook_source: Optional[str],
     dataset_path: Optional[str],
 ) -> dict:
+    """
+    检查逆向设计检查点中几何编码头的就绪状态。
+    返回 ready/issue/warnings/checkpoint_variant 等诊断信息。
+    """
     policy_state = {}
     if isinstance(checkpoint, dict):
         maybe_policy = checkpoint.get("policy")
         if isinstance(maybe_policy, dict):
             policy_state = maybe_policy
 
-    policy_keys = list(policy_state.keys())
+    policy_keys = list(policy_state)
     has_geometry_code_head = any(str(key).startswith("geometry_code_head.") for key in policy_keys)
     has_legacy_geo_head = any(str(key).startswith("geo_head.") for key in policy_keys)
     has_action_heads = any(
@@ -105,20 +115,27 @@ def load_inverse_bundle(
     allow_fresh_fallback: bool,
     require_geometry_code_ready: bool = False,
 ) -> Optional[dict]:
+    """
+    加载逆向设计模型包（策略网络 + 曲线编码器 + 动作码本 + PPOAgent）。
+    检查点缺失时根据 allow_fresh_fallback 决定是否使用随机权重。
+    """
     ckpt = None
     action_codebook = None
     action_codebook_source = None
+
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         action_codebook = ckpt.get("action_codebook")
         if action_codebook is not None:
             action_codebook_source = "checkpoint"
+
     paths_cfg = cfg.get("paths", {})
     dataset_path = paths_cfg.get("il_multistep_dataset_output") or paths_cfg.get("il_dataset_output")
     if action_codebook is None:
         if dataset_path and os.path.exists(str(Path(dataset_path).with_suffix(".codebook.pt"))):
             action_codebook = load_action_codebook(dataset_path)
             action_codebook_source = "external"
+
     if action_codebook is not None:
         cfg.setdefault("gnn_policy", {})
         cfg["gnn_policy"]["num_geometry_codes"] = max(1, len(action_codebook.get("entries", [])))
@@ -130,6 +147,7 @@ def load_inverse_bundle(
         latent_dim=cfg["curve_encoder"]["latent_dim"],
     ).to(device)
     policy = GNNPolicy(cfg).to(device)
+
     if action_codebook is not None:
         policy.set_action_codebook(
             codebook_tensor(action_codebook).to(device),
@@ -211,6 +229,10 @@ def load_rollout_bundle_with_fallback(
     require_geometry_code_ready: bool = False,
     candidate_order: Optional[Sequence[str]] = None,
 ) -> Optional[dict]:
+    """
+    加载推理用模型包，支持 IL/RL 多模型类型回退。
+    选择第一个检查点已加载且几何编码就绪的模型。
+    """
     requested = str(preferred_model_type).strip().lower()
     ordered_candidates = list(candidate_order or (requested, "il", "rl"))
     order = []
@@ -237,9 +259,7 @@ def load_rollout_bundle_with_fallback(
             }
             continue
         bundle = load_inverse_bundle(
-            cfg,
-            ckpt_path,
-            device,
+            cfg, ckpt_path, device,
             allow_fresh_fallback=allow_fresh_fallback,
             require_geometry_code_ready=False,
         )
@@ -287,6 +307,7 @@ def load_rollout_bundle_with_fallback(
 
 
 def encode_target(curve_encoder, target: dict, device):
+    """将目标曲线编码为条件向量 z_c。"""
     with torch.no_grad():
         return curve_encoder(
             target["y_foot"].unsqueeze(0).to(device),
@@ -296,6 +317,10 @@ def encode_target(curve_encoder, target: dict, device):
 
 
 def rollout_trace_policy(bundle, trace_record, cfg, device):
+    """
+    使用确定性策略执行单次 rollout 推理。
+    逐步调用策略网络选择动作并应用 J-Operator，直到停止或达到最大步数。
+    """
     z_c = encode_target(bundle["curve_encoder"], trace_record["target"], device)
     current_graph = trace_record["base_data"]
     expected_j_steps = int(trace_record["expected_j_steps"])
@@ -309,8 +334,7 @@ def rollout_trace_policy(bundle, trace_record, cfg, device):
             "stop_threshold": cfg.get("reward", {}).get("stop_threshold", 0.5),
         }
         actions, _, _ = bundle["agent"].batch_select_actions(
-            [current_graph],
-            z_c,
+            [current_graph], z_c,
             deterministic=True,
             contexts=[context],
         )
@@ -320,16 +344,17 @@ def rollout_trace_policy(bundle, trace_record, cfg, device):
 
         current_graph = apply_j_operator(
             current_graph,
-            action["u"],
-            action["v"],
-            action["w"],
-            action["n1"],
-            action["n2"],
+            action["u"], action["v"], action["w"],
+            action["n1"], action["n2"],
         )
     return current_graph
 
 
 def rollout_trace_with_mcts(bundle, trace_record, surrogate, cfg, device):
+    """
+    使用 MCTS 重排序器执行 rollout 推理。
+    枚举多条候选轨迹，用代理模型评分选最优。
+    """
     z_c = encode_target(bundle["curve_encoder"], trace_record["target"], device)
     reranker = MCTS(bundle["agent"], surrogate, cfg, device)
     result = reranker.rerank_rollouts(

@@ -1,9 +1,16 @@
 import unittest
+import sys
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
 import torch
 from torch_geometric.data import Data
+
+GMM_ROOT = Path(__file__).resolve().parents[2]
+for root in (GMM_ROOT, GMM_ROOT / "code"):
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
 
 from train_inverse_bio import PreBatchedLoader
 from src.inverse.gnn_policy import GNNPolicy
@@ -24,6 +31,12 @@ class TestHighPriorityFixes(unittest.TestCase):
                 'base_data': base_data,
                 'action_topo': torch.tensor([0, 0, 0], dtype=torch.long),
                 'action_geo': torch.zeros(4, dtype=torch.float32),
+                'family_index': 0,
+                'step_index': 0,
+                'step_count': 1,
+                'step_role_index': 0,
+                'stop_token': 0.0,
+                'action_code_id': 0,
                 'y_foot': torch.zeros(200, 2, dtype=torch.float32),
                 'y_knee': torch.zeros(200, dtype=torch.float32),
                 'y_ankle': torch.zeros(200, dtype=torch.float32),

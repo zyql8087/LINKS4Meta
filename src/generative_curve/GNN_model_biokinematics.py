@@ -1,4 +1,8 @@
 # src/generative_curve/GNN_model_biokinematics.py
+"""
+生物运动学 GNN 模型：通过图神经网络编码网格结构，按身体部位（足/膝/踝）池化后
+解码出各部位的运动曲线。
+"""
 
 from __future__ import annotations
 
@@ -11,7 +15,10 @@ from src.utils import MLP
 
 
 class BioKinematicsGNN(nn.Module):
+    """生物运动学图神经网络，接收 PyG 图数据，输出足部轨迹和膝/踝关节角度曲线。"""
+
     def __init__(self, config):
+        """根据 config 构建 GNN 编码器、家族嵌入、步态上下文编码器和三个解码器。"""
         super().__init__()
         self.config = config
 
@@ -36,7 +43,9 @@ class BioKinematicsGNN(nn.Module):
         self.step_context_input_dim = int(decoder_cfg.get("step_context_input_dim", 3))
         self.step_context_hidden_dim = int(decoder_cfg.get("step_context_hidden_dim", 16))
 
+        # 至少保证维度为 1，避免 Embedding 维度为 0
         self.family_embedding = nn.Embedding(max(self.num_families, 1), max(self.family_embedding_dim, 1))
+
         self.step_context_encoder = nn.Sequential(
             nn.Linear(self.step_context_input_dim, self.step_context_hidden_dim),
             nn.ELU(),
@@ -48,6 +57,7 @@ class BioKinematicsGNN(nn.Module):
         decoder_input_dim = self.hidden_dim + self.family_embedding_dim + self.step_context_hidden_dim
 
         def make_mlp_dims(input_dim, output_dim, num_layers):
+            """生成 MLP 各层维度列表，中间隐藏层均为 decoder_hidden 维。"""
             return [input_dim] + [decoder_hidden] * max(num_layers - 1, 1) + [output_dim]
 
         self.decoder_foot = MLP(
@@ -62,6 +72,7 @@ class BioKinematicsGNN(nn.Module):
 
     @staticmethod
     def semantic_pool(x, mask, batch_idx):
+        """根据掩码将指定语义角色的节点特征按图求和聚合，返回图级特征。"""
         if mask is None or int(mask.sum().item()) == 0:
             num_graphs = int(batch_idx.max().item()) + 1 if batch_idx.numel() > 0 else 1
             return x.new_zeros((num_graphs, x.size(-1)))
@@ -69,6 +80,7 @@ class BioKinematicsGNN(nn.Module):
         return scatter(target_nodes_x, batch_idx, dim=0, reduce="add")
 
     def _graph_context(self, data):
+        """拼接家族嵌入和步态上下文编码，返回图级上下文向量。"""
         num_graphs = int(data.batch.max().item()) + 1 if data.batch.numel() > 0 else 1
 
         family_id = getattr(data, "family_id", None)
@@ -98,19 +110,23 @@ class BioKinematicsGNN(nn.Module):
 
     @staticmethod
     def _semantic_masks(data):
+        """提取足/膝/踝三个部位的布尔掩码，支持从属性、节点特征或关键点索引获取。"""
         num_nodes = data.x.size(0)
 
+        # 方式1：直接使用预计算的掩码属性
         if hasattr(data, "mask_foot") and data.mask_foot is not None:
             return data.mask_foot, getattr(data, "mask_knee", None), getattr(data, "mask_ankle", None)
 
+        # 方式2：从节点特征最后4维解析语义角色
         if data.x.size(-1) >= 8:
             semantic_roles = data.x[:, -4:]
             return (
-                semantic_roles[:, 3] > 0.5,
-                semantic_roles[:, 1] > 0.5,
-                semantic_roles[:, 2] > 0.5,
+                semantic_roles[:, 3] > 0.5,  # 足部
+                semantic_roles[:, 1] > 0.5,  # 膝部
+                semantic_roles[:, 2] > 0.5,  # 踝部
             )
 
+        # 方式3：通过关键点索引构建掩码
         if hasattr(data, "keypoints") and data.keypoints is not None:
             mask_foot = torch.zeros(num_nodes, dtype=torch.bool, device=data.x.device)
             mask_knee = torch.zeros(num_nodes, dtype=torch.bool, device=data.x.device)
@@ -142,10 +158,12 @@ class BioKinematicsGNN(nn.Module):
             mask_ankle[global_kp[:, 2][valid_mask[:, 2]]] = True
             return mask_foot, mask_knee, mask_ankle
 
+        # 方式4：退化方案，所有节点参与所有部位
         mask_all = torch.ones(num_nodes, dtype=torch.bool, device=data.x.device)
         return mask_all, mask_all, mask_all
 
     def forward(self, data):
+        """前向传播：GNN编码 -> 语义池化 -> 拼接上下文 -> 解码输出 (pred_foot, pred_knee, pred_ankle)。"""
         edge_attr = getattr(data, "edge_attr", None)
         if edge_attr is None:
             pos = data.pos if hasattr(data, "pos") and data.pos is not None else data.x[:, :2]
@@ -165,6 +183,7 @@ class BioKinematicsGNN(nn.Module):
         feat_foot = self.semantic_pool(x_encoded, mask_foot, data.batch)
         feat_knee = self.semantic_pool(x_encoded, mask_knee, data.batch)
         feat_ankle = self.semantic_pool(x_encoded, mask_ankle, data.batch)
+
         graph_context = self._graph_context(data)
 
         feat_foot = torch.cat([feat_foot, graph_context], dim=-1)

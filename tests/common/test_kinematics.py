@@ -4,7 +4,7 @@ import sys
 import os
 
 # Add project root to path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from src.kinematics_extract import compute_angle, normalize_trajectory, extract_kinematics
 

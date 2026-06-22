@@ -1,3 +1,4 @@
+"""数据集加载与DataLoader管理，支持.pt/.pkl文件、族过滤和训练/验证/测试拆分。"""
 import os
 import pickle
 import json
@@ -11,15 +12,11 @@ from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 from src.forward_dataset_utils import FAMILY_TO_ID, family_id_to_name, sample_to_pyg_data
 
+
 class GraphCurveDataset(Dataset):
-    """
-    PyG Dataset for loading the biological 6-bar mechanism data from a .pt file.
-    Each sample has: x (node coords), edge_index, edge_attr (lengths),
-                     mask_foot, mask_knee, mask_ankle,
-                     y_foot, y_knee, y_ankle
-    """
+    """将预处理好的 PyG Data 对象列表包装为 Dataset。"""
     def __init__(self, data_list, transform=None, pre_transform=None):
-        super(GraphCurveDataset, self).__init__(None, transform, pre_transform)
+        super().__init__(None, transform, pre_transform)
         self.data_list = data_list
 
     def len(self):
@@ -30,9 +27,7 @@ class GraphCurveDataset(Dataset):
 
 
 class DataLoaderFactory:
-    """
-    Factory class to create train/val/test DataLoaders from a .pt dataset file.
-    """
+    """数据加载工厂：从配置加载数据集、按族过滤、拆分并创建DataLoader。"""
     def __init__(self, config):
         self.config = config
         self.dataset_path = self._resolve_dataset_path(config.get('dataset_path', ''))
@@ -42,11 +37,10 @@ class DataLoaderFactory:
         self.val_ratio = config.get('val_ratio', 0.1)
         self.test_ratio = config.get('test_ratio', 0.1)
         self.seed = config.get('seed', 42)
-        
-        # Load all data
         self._load_data()
 
     def _resolve_dataset_path(self, dataset_path):
+        """解析数据集路径，优先绝对路径，否则从配置目录和cwd依次查找。"""
         path = Path(dataset_path)
         if path.is_absolute():
             return str(path)
@@ -64,6 +58,7 @@ class DataLoaderFactory:
         ]
 
     def _resolve_optional_path(self, path_value):
+        """解析可选路径，空值返回None。"""
         if not path_value:
             return None
         path = Path(path_value)
@@ -76,6 +71,7 @@ class DataLoaderFactory:
         return str(candidates[0])
 
     def _normalize_allowed_family_ids(self, family_values):
+        """将族名称/ID列表规范化为整数ID集合，空输入返回None。"""
         if not family_values:
             return None
         if isinstance(family_values, str):
@@ -91,6 +87,7 @@ class DataLoaderFactory:
 
     @staticmethod
     def _scalar_attr(data, attr_name, default=-1):
+        """从Data对象安全提取标量属性值。"""
         value = getattr(data, attr_name, None)
         if value is None:
             return default
@@ -104,6 +101,7 @@ class DataLoaderFactory:
         return [self._scalar_attr(data, 'sample_id', idx) for idx, data in enumerate(self.all_data)]
 
     def _apply_family_filter(self):
+        """按允许的机构族ID过滤数据集。"""
         if not self.allowed_family_ids:
             return
         filtered = []
@@ -112,48 +110,46 @@ class DataLoaderFactory:
             if family_id in self.allowed_family_ids:
                 filtered.append(data)
         self.all_data = filtered
-        family_names = [family_id_to_name(family_id) for family_id in sorted(self.allowed_family_ids)]
+        family_names = [family_id_to_name(fid) for fid in sorted(self.allowed_family_ids)]
         print(f"Applied family filter: {family_names} -> {len(self.all_data)} samples")
-        
+
     def _load_data(self):
-        """Load and split the dataset"""
+        """加载数据集文件，执行族过滤和Phase3特征检查，然后拆分。"""
         print(f"Loading dataset from: {self.dataset_path}")
-        
+
         if self.dataset_path.endswith('.pt'):
             self.all_data = torch.load(self.dataset_path, weights_only=False)
         elif self.dataset_path.endswith('.pkl'):
             with open(self.dataset_path, 'rb') as f:
                 raw_data = pickle.load(f)
-            # Convert raw data to PyG Data objects
             self.all_data = self._convert_to_pyg(raw_data)
         else:
             raise ValueError(f"Unsupported file format: {self.dataset_path}")
 
         self._apply_family_filter()
         self._warn_if_phase3_features_missing()
-            
         print(f"Loaded {len(self.all_data)} samples")
-        
+
         if self.split_indices_path and Path(self.split_indices_path).exists():
             self._load_precomputed_split()
         else:
             self._random_split()
-        
+
         print(f"Split: train={len(self.train_indices)}, val={len(self.val_indices)}, test={len(self.test_indices)}")
 
     def _random_split(self):
+        """按比例随机拆分数据集。"""
         torch.manual_seed(self.seed)
         indices = torch.randperm(len(self.all_data)).tolist()
-
         n_total = len(self.all_data)
         n_train = int(n_total * self.train_ratio)
         n_val = int(n_total * self.val_ratio)
-
         self.train_indices = indices[:n_train]
         self.val_indices = indices[n_train:n_train + n_val]
         self.test_indices = indices[n_train + n_val:]
 
     def _load_precomputed_split(self):
+        """加载预计算拆分索引（JSON或PT格式），若已做族过滤则映射为局部索引。"""
         split_path = Path(self.split_indices_path)
         if split_path.suffix.lower() == '.json':
             with split_path.open('r', encoding='utf-8') as f:
@@ -166,10 +162,10 @@ class DataLoaderFactory:
         test_indices = list(split.get('test_indices', split.get('test', [])))
 
         if self.allowed_family_ids:
-            id_to_local = {sample_id: idx for idx, sample_id in enumerate(self._sample_ids())}
-            self.train_indices = [id_to_local[idx] for idx in train_indices if idx in id_to_local]
-            self.val_indices = [id_to_local[idx] for idx in val_indices if idx in id_to_local]
-            self.test_indices = [id_to_local[idx] for idx in test_indices if idx in id_to_local]
+            id_to_local = {sid: idx for idx, sid in enumerate(self._sample_ids())}
+            self.train_indices = [id_to_local[i] for i in train_indices if i in id_to_local]
+            self.val_indices = [id_to_local[i] for i in val_indices if i in id_to_local]
+            self.test_indices = [id_to_local[i] for i in test_indices if i in id_to_local]
         else:
             self.train_indices = train_indices
             self.val_indices = val_indices
@@ -180,6 +176,7 @@ class DataLoaderFactory:
         self._validate_split_indices(split_path)
 
     def _validate_split_indices(self, split_path):
+        """验证拆分索引：无重复、无越界、无交叉、全覆盖。"""
         seen = set()
         for split_name, indices in (
             ('train', self.train_indices),
@@ -203,6 +200,7 @@ class DataLoaderFactory:
             raise ValueError(f'Split file {split_path} does not cover all samples; missing={missing[:10]}')
 
     def _warn_if_phase3_features_missing(self):
+        """检查数据集是否包含Phase3前向模型所需特征（语义通道、family_id等）。"""
         if not self.all_data:
             return
         sample = self.all_data[0]
@@ -210,12 +208,9 @@ class DataLoaderFactory:
         x = getattr(sample, 'x', None)
         if x is None or x.size(-1) < 8:
             missing.append('semantic node channels')
-        if not hasattr(sample, 'family_id'):
-            missing.append('family_id')
-        if not hasattr(sample, 'step_context'):
-            missing.append('step_context')
-        if not hasattr(sample, 'retrieval_feature'):
-            missing.append('retrieval_feature')
+        for attr in ('family_id', 'step_context', 'retrieval_feature'):
+            if not hasattr(sample, attr):
+                missing.append(attr)
         if missing:
             print(
                 "[WARN] Dataset is missing phase3 forward features: "
@@ -223,44 +218,44 @@ class DataLoaderFactory:
                 + ". Regenerate the PT from the latest pkl via dataset_tool convert, "
                 + "or point config_dataset.yaml to the pkl source."
             )
-    
+
     def _convert_to_pyg(self, raw_data):
-        """Convert raw pickle data to PyG Data objects with curve generation"""
+        """将pickle格式的原始样本列表转为PyG Data对象列表。"""
         print("Converting raw samples to PyG Data objects...")
         data_list = []
         errors = 0
-        
         for idx, sample in enumerate(tqdm(raw_data, desc="Converting")):
             try:
                 data = sample_to_pyg_data(sample, idx)
                 data_list.append(data)
-                
             except Exception as e:
                 errors += 1
                 if errors < 5:
                     print(f"Error converting sample {idx}: {e}")
-        
         if errors > 0:
             print(f"Encountered {errors} errors during conversion.")
-            
         return data_list
-        
+
     def create_train_loader(self, batch_size=32, shuffle=True, num_workers=0, pin_memory=False, persistent_workers=False):
+        """创建训练集DataLoader。"""
         train_data = [self.all_data[i] for i in self.train_indices]
         dataset = GraphCurveDataset(train_data)
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=pin_memory, persistent_workers=persistent_workers)
-    
+
     def create_val_loader(self, batch_size=32, shuffle=False, num_workers=0, pin_memory=False, persistent_workers=False):
+        """创建验证集DataLoader。"""
         val_data = [self.all_data[i] for i in self.val_indices]
         dataset = GraphCurveDataset(val_data)
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=pin_memory, persistent_workers=persistent_workers)
-    
+
     def create_test_loader(self, batch_size=32, shuffle=False, num_workers=0, pin_memory=False, persistent_workers=False):
+        """创建测试集DataLoader。"""
         test_data = [self.all_data[i] for i in self.test_indices]
         dataset = GraphCurveDataset(test_data)
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=pin_memory, persistent_workers=persistent_workers)
 
     def get_split_data(self, split_name):
+        """按拆分名称 ('train'/'val'/'test') 获取数据列表。"""
         split_map = {
             'train': self.train_indices,
             'val': self.val_indices,

@@ -3,6 +3,8 @@ __pycache__/
 .pytest_cache/
 
 demo/outputs/
+output/
+*.docx
 *.pt
 *.pth
 *.ckpt

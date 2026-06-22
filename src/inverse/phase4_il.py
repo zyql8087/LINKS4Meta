@@ -1,3 +1,5 @@
+"""Phase 4 多步模仿学习模块。实现从专家轨迹中学习多步 J-算子操作的完整流程，
+包括专家路径提取、动作码本构建、Phase4 损失计算、多步重建评估和课程学习。"""
 from __future__ import annotations
 
 import copy
@@ -35,6 +37,7 @@ from src.inverse.train_il import _batch_offsets
 from src.kinematics_extract import extract_kinematics
 
 
+# ─── 常量 ─────────────────────────────────────────────────────────────────────
 FAMILY_ORDER = ("6bar", "7bar", "8bar", "9bar")
 FAMILY_TO_INDEX = {name: idx for idx, name in enumerate(FAMILY_ORDER)}
 STEP_ROLE_TO_INDEX = {"aux": 0, "semantic": 1}
@@ -47,19 +50,21 @@ DEFAULT_CURRICULUM_STAGES = (
 
 
 def family_name_to_index(name: str) -> int:
+    """将机构族名称转为索引，未知族返回 len(FAMILY_ORDER)。"""
     return FAMILY_TO_INDEX.get(str(name), len(FAMILY_ORDER))
 
 
 def _curve_tensor(sample: dict, key: str, fallback_idx: int) -> torch.Tensor:
+    """从样本中提取曲线张量，优先使用预存数据，否则从运动学计算。"""
     value = sample.get(key)
     if value is not None:
         return torch.as_tensor(value, dtype=torch.float32)
-
     curves = extract_kinematics(sample)
     return torch.as_tensor(curves[fallback_idx], dtype=torch.float32)
 
 
 def _analysis_knee_idx(sample: dict) -> int | None:
+    """从样本中获取膝关节节点索引。"""
     analysis = sample.get("analysis") or {}
     if "knee" in analysis:
         return int(analysis["knee"])
@@ -70,6 +75,7 @@ def _analysis_knee_idx(sample: dict) -> int | None:
 
 
 def _base_nodes_before_step(total_nodes: int, trace: Sequence[dict], step_index: int) -> list[int]:
+    """获取第 step_index 步之前的基础节点列表（排除后续步骤添加的 n1, n2）。"""
     removed_nodes: set[int] = set()
     for step in trace[step_index:]:
         removed_nodes.add(int(step["n1"]))
@@ -78,6 +84,7 @@ def _base_nodes_before_step(total_nodes: int, trace: Sequence[dict], step_index:
 
 
 def _build_step_base_graph(sample: dict, step_index: int):
+    """为指定步骤构建基础图状态，返回 (base_data, node_remap)。"""
     A = np.asarray(sample["A"])
     x0 = np.asarray(sample["x0"], dtype=np.float32)
     types = np.asarray(sample["types"])
@@ -114,6 +121,7 @@ def _build_step_base_graph(sample: dict, step_index: int):
 
 
 def _default_anchor_pair_mask(base_data: Data) -> torch.Tensor:
+    """生成默认的锚点配对掩码（移动节点间可配对，排除自环）。"""
     moving_mask = (base_data.x[:, 2] <= 0.5)
     pair_mask = moving_mask[:, None] & moving_mask[None, :]
     pair_mask.fill_diagonal_(False)
@@ -121,6 +129,7 @@ def _default_anchor_pair_mask(base_data: Data) -> torch.Tensor:
 
 
 def _step_semantic_mask(base_data: Data, action_topo: torch.Tensor, step_role: str) -> torch.Tensor:
+    """生成语义掩码（仅语义步标记锚点节点）。"""
     mask = torch.zeros(base_data.x.size(0), dtype=torch.bool)
     if str(step_role) == "semantic":
         mask[action_topo.long()] = True
@@ -131,6 +140,7 @@ def _attach_doc_masks(
     step_paths: Sequence[dict[str, object]],
     codebook: dict[str, object],
 ) -> list[dict[str, object]]:
+    """为专家路径附加文档掩码（anchor/pair/geom/semantic mask）。"""
     updated = []
     num_codes = max(1, len(codebook.get("entries", [])))
     for item in step_paths:
@@ -177,24 +187,19 @@ def _attach_doc_masks(
 
 
 def multistep_paths_have_phase4_format(paths) -> bool:
+    """检查专家路径是否已具备 Phase4 格式。"""
     if not paths:
         return False
     sample = paths[0]
     required = {
-        "raw_index",
-        "trace_id",
-        "step_index",
-        "step_count",
-        "stop_token",
-        "family_index",
-        "step_role_index",
-        "action_code_id",
-        "action_code_vec",
+        "raw_index", "trace_id", "step_index", "step_count", "stop_token",
+        "family_index", "step_role_index", "action_code_id", "action_code_vec",
     }
-    return required.issubset(sample.keys())
+    return required.issubset(sample)
 
 
 def _action_codebook_cfg(codebook_cfg: dict | None) -> dict[str, object]:
+    """解析码本配置，填充默认值。"""
     cfg = dict(codebook_cfg or {})
     fine_bucket_policy = dict(cfg.get("fine_buckets", {}))
     return {
@@ -215,6 +220,7 @@ def codebook_cache_is_stale(
     *,
     required_version: str = CODEBOOK_VERSION,
 ) -> bool:
+    """检查码本缓存是否过期（格式不匹配、版本不一致或缺少必要 bucket）。"""
     if not multistep_paths_have_phase4_format(expert_paths):
         return True
     if str(codebook.get("version", "")) != str(required_version):
@@ -243,6 +249,7 @@ def extract_multistep_expert_paths(
     action_codebook_cfg: dict | None = None,
     constraint_cfg: dict | None = None,
 ):
+    """从 pkl 文件提取多步专家路径，构建动作码本，附加文档掩码后保存。"""
     print(f"Loading multistep IL pkl from {pkl_path} ...")
     with open(pkl_path, "rb") as handle:
         raw_data = pickle.load(handle)
@@ -286,11 +293,8 @@ def extract_multistep_expert_paths(
 
                 step_role = str(step.get("step_role") or ("semantic" if bool(step.get("is_semantic")) else "aux"))
                 action_code_vec = encode_local_dyad_code(
-                    sample["x0"][u],
-                    sample["x0"][v],
-                    sample["x0"][w],
-                    sample["x0"][n1],
-                    sample["x0"][n2],
+                    sample["x0"][u], sample["x0"][v], sample["x0"][w],
+                    sample["x0"][n1], sample["x0"][n2],
                 )
                 expert_paths.append(
                     {
@@ -313,12 +317,8 @@ def extract_multistep_expert_paths(
                         "trace_seed_graph": seed_graph,
                         "action_topo": torch.tensor([u_r, v_r, w_r], dtype=torch.long),
                         "action_geo": torch.tensor(
-                            [
-                                float(sample["x0"][n1][0]),
-                                float(sample["x0"][n1][1]),
-                                float(sample["x0"][n2][0]),
-                                float(sample["x0"][n2][1]),
-                            ],
+                            [float(sample["x0"][n1][0]), float(sample["x0"][n1][1]),
+                             float(sample["x0"][n2][0]), float(sample["x0"][n2][1])],
                             dtype=torch.float32,
                         ),
                         "action_anchor_pair": torch.tensor([u_r, v_r], dtype=torch.long),
@@ -327,9 +327,7 @@ def extract_multistep_expert_paths(
                         "action_support": int(w_r),
                         "action_code_vec": torch.tensor(action_code_vec, dtype=torch.float32),
                         "action_code_bucket": codebook_bucket_for_step(
-                            family_name,
-                            step_role,
-                            step_index=step_index,
+                            family_name, step_role, step_index=step_index,
                             action_topo=[u_r, v_r, w_r],
                             topology_signature=sample.get("topology_signature"),
                             fine_topology_buckets=fine_buckets_enabled,
@@ -381,6 +379,7 @@ def ensure_multistep_expert_paths(
     action_codebook_cfg: dict | None = None,
     constraint_cfg: dict | None = None,
 ):
+    """确保多步专家路径数据可用。优先加载缓存，若缓存过期则重新提取。"""
     if use_cached and os.path.exists(output_path):
         print(f"[*] Loading cached multistep IL dataset from {output_path}")
         expert_paths = torch.load(output_path, map_location="cpu", weights_only=False)
@@ -391,10 +390,8 @@ def ensure_multistep_expert_paths(
                 return expert_paths
         print("[*] Cached multistep IL dataset is stale; regenerating...")
     return extract_multistep_expert_paths(
-        pkl_path=pkl_path,
-        output_path=output_path,
-        action_codebook_cfg=action_codebook_cfg,
-        constraint_cfg=constraint_cfg,
+        pkl_path=pkl_path, output_path=output_path,
+        action_codebook_cfg=action_codebook_cfg, constraint_cfg=constraint_cfg,
     )
 
 
@@ -407,15 +404,13 @@ def load_step_split(
     test_ratio: float = 0.1,
     split_seed: int = 42,
 ) -> dict[str, object]:
+    """加载或生成步骤级数据划分并保存到磁盘。"""
     if precomputed_split_path and os.path.exists(precomputed_split_path):
         raw_split = _load_split_artifact(precomputed_split_path)
         split = _map_precomputed_group_split(step_paths, raw_split, source_path=precomputed_split_path)
     else:
         split = _random_group_split(
-            step_paths,
-            val_ratio=val_ratio,
-            test_ratio=test_ratio,
-            split_seed=split_seed,
+            step_paths, val_ratio=val_ratio, test_ratio=test_ratio, split_seed=split_seed,
         )
 
     split_dir = os.path.dirname(split_path)
@@ -426,6 +421,7 @@ def load_step_split(
 
 
 def _load_split_artifact(split_path: str) -> dict[str, object]:
+    """加载划分文件，支持 JSON 和 pt 格式。"""
     path = Path(split_path)
     if path.suffix.lower() == ".json":
         with path.open("r", encoding="utf-8") as handle:
@@ -434,6 +430,7 @@ def _load_split_artifact(split_path: str) -> dict[str, object]:
 
 
 def _canonical_split_indices(split: dict[str, object]) -> dict[str, list[int]]:
+    """规范化划分索引键名。"""
     return {
         "train": [int(idx) for idx in split.get("train_indices", split.get("train", []))],
         "val": [int(idx) for idx in split.get("val_indices", split.get("val", []))],
@@ -447,6 +444,7 @@ def _map_precomputed_group_split(
     *,
     source_path: str,
 ) -> dict[str, object]:
+    """将预计算的样本级划分映射到步骤级划分。"""
     split_ids = {name: set(indices) for name, indices in _canonical_split_indices(raw_split).items()}
     mapped = {"train_indices": [], "val_indices": [], "test_indices": []}
     for local_idx, item in enumerate(step_paths):
@@ -487,11 +485,12 @@ def _random_group_split(
     test_ratio: float,
     split_seed: int,
 ) -> dict[str, object]:
+    """按 trace 分组随机划分训练/验证/测试集。"""
     traces: dict[int, list[int]] = defaultdict(list)
     for local_idx, item in enumerate(step_paths):
         traces[int(item["sample_id"])].append(local_idx)
 
-    trace_ids = list(traces.keys())
+    trace_ids = list(traces)
     rng = random.Random(split_seed)
     rng.shuffle(trace_ids)
 
@@ -524,6 +523,7 @@ def _random_group_split(
 
 
 def _trace_counts_for_split(step_paths: Sequence[dict[str, object]], split: dict[str, list[int]]) -> dict[str, int]:
+    """统计各划分中的唯一 trace 数量。"""
     counts = {}
     for split_name in ("train_indices", "val_indices", "test_indices"):
         trace_ids = {int(step_paths[idx]["sample_id"]) for idx in split[split_name]}
@@ -532,6 +532,7 @@ def _trace_counts_for_split(step_paths: Sequence[dict[str, object]], split: dict
 
 
 def _validate_step_split(step_paths: Sequence[dict[str, object]], split: dict[str, list[int]]) -> None:
+    """验证划分的完整性和无交叉性。"""
     seen: set[int] = set()
     trace_to_split: dict[int, str] = {}
     for split_name in ("train_indices", "val_indices", "test_indices"):
@@ -551,26 +552,25 @@ def _validate_step_split(step_paths: Sequence[dict[str, object]], split: dict[st
 
 
 def subset_by_indices(items: Sequence, indices: Sequence[int]) -> list:
+    """按索引提取子集。"""
     return [items[int(idx)] for idx in indices]
 
 
 def filter_paths_by_families(paths: Sequence[dict[str, object]], families: Iterable[str]) -> list[dict[str, object]]:
+    """按族名过滤路径。"""
     family_set = {str(name) for name in families}
     return [item for item in paths if str(item["family_id"]) in family_set]
 
 
 def build_stage_plan(il_cfg: dict) -> list[dict[str, object]]:
+    """构建课程学习阶段计划。"""
     configured = il_cfg.get("curriculum_stages")
     if configured:
         return [dict(stage) for stage in configured]
     epochs = int(il_cfg.get("epochs", 100))
     patience = int(il_cfg.get("patience", 20))
     return [
-        {
-            **stage,
-            "epochs": int(stage.get("epochs", epochs)),
-            "patience": int(stage.get("patience", patience)),
-        }
+        {**stage, "epochs": int(stage.get("epochs", epochs)), "patience": int(stage.get("patience", patience))}
         for stage in DEFAULT_CURRICULUM_STAGES
     ]
 
@@ -581,12 +581,14 @@ def _masked_group_nll_loss(
     valid_mask: torch.Tensor,
     global_targets: torch.Tensor,
 ) -> torch.Tensor:
+    """带掩码的分组 NLL 损失（无效位置填充 -inf 后 softmax）。"""
     masked_logits = logits.masked_fill(~valid_mask, -1e9)
     probs = softmax(masked_logits, batch_index)
     return (-torch.log(probs[global_targets] + 1e-12)).mean()
 
 
 def _argmax_per_graph(logits: torch.Tensor, batch_index: torch.Tensor, valid_mask: torch.Tensor, offsets: torch.Tensor):
+    """在每个子图的有效位置上取 argmax。"""
     predictions = []
     for graph_idx in range(int(offsets.numel())):
         start = int(offsets[graph_idx].item())
@@ -604,6 +606,7 @@ def _code_bucket_mask(
     action_topos: torch.Tensor | None = None,
     step_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """构建几何码本的 bucket 掩码，仅允许当前上下文对应的码本条目。"""
     num_rows = int(target_ids.numel())
     num_codes = int(policy.action_codebook.size(0)) if hasattr(policy, "action_codebook") else 0
     if num_codes <= 0:
@@ -616,16 +619,14 @@ def _code_bucket_mask(
         step_role = "semantic" if int(step_role_ids[row_idx].item()) == 1 else "aux"
         action_topo = action_topos[row_idx] if action_topos is not None else None
         bucket = resolve_codebook_bucket_for_step(
-            bucket_map,
-            family_name,
-            step_role,
+            bucket_map, family_name, step_role,
             step_index=int(step_indices[row_idx].item()) if step_indices is not None else None,
             action_topo=action_topo,
         )
         allowed_ids = list(bucket_map.get(bucket, []))
         if not allowed_ids:
             allowed_ids = list(range(num_codes))
-        # Keep the truth class legal even when a stale bucket map is missing an id.
+        # 确保真值类始终合法
         truth_id = int(target_ids[row_idx].item())
         if 0 <= truth_id < num_codes and truth_id not in allowed_ids:
             allowed_ids.append(truth_id)
@@ -634,12 +635,14 @@ def _code_bucket_mask(
 
 
 def _topk_code_accuracy(logits: torch.Tensor, targets: torch.Tensor, k: int) -> torch.Tensor:
+    """计算 Top-K 码准确率。"""
     k = min(int(k), int(logits.size(-1)))
     topk = torch.topk(logits, k=k, dim=-1).indices
     return (topk == targets.view(-1, 1)).any(dim=-1).float().mean()
 
 
 def _topk_oracle_accuracy(logits: torch.Tensor, positive_mask: torch.Tensor | None, k: int) -> torch.Tensor:
+    """计算 Oracle Top-K 准确率（命中任一正样本即算正确）。"""
     if positive_mask is None or positive_mask.numel() == 0:
         return logits.sum() * 0.0
     k = min(int(k), int(logits.size(-1)))
@@ -657,6 +660,7 @@ def _apply_code_vector_for_oracle(
     code_vec: Sequence[float],
     constraint_cfg: dict | None,
 ) -> tuple[bool, str | None, np.ndarray | None]:
+    """应用码本向量到图上，验证几何有效性。返回 (is_valid, reason, candidate_geo)。"""
     try:
         u, v, w = [int(value) for value in list(action_topo)[:3]]
         node_count = int(graph.pos.size(0))
@@ -678,6 +682,7 @@ def _apply_code_vector_for_oracle(
 
 
 def _normalised_geometry_error(graph: Data, action_topo: Sequence[int], candidate_geo: np.ndarray, truth_geo) -> float:
+    """计算归一化几何误差（RMSE / span）。"""
     u, v, _ = [int(value) for value in list(action_topo)[:3]]
     span = float(torch.linalg.norm(graph.pos[v] - graph.pos[u]).detach().cpu().item())
     span = max(span, 1.0e-8)
@@ -688,15 +693,11 @@ def _normalised_geometry_error(graph: Data, action_topo: Sequence[int], candidat
 
 
 def _oracle_group_template() -> dict[str, object]:
-    return {
-        "count": 0,
-        "oracle_positive": 0,
-        "valid_code_available": 0,
-        "oracle_uncovered": 0,
-    }
+    return {"count": 0, "oracle_positive": 0, "valid_code_available": 0, "oracle_uncovered": 0}
 
 
 def _finalise_oracle_group(group: dict[str, object]) -> dict[str, object]:
+    """将 Oracle 组计转为覆盖率指标。"""
     count = int(group.get("count", 0))
     positive = int(group.get("oracle_positive", 0))
     valid = int(group.get("valid_code_available", 0))
@@ -717,11 +718,12 @@ def attach_oracle_code_targets(
     codebook: dict[str, object],
     cfg: dict,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """为每个专家步预计算 Oracle 码目标：遍历允许码本，标记正样本/有效码/无效码。"""
     oracle_cfg = dict(cfg.get("il_training", {}).get("oracle_code_loss", {}) or {})
     threshold = float(oracle_cfg.get("positive_error_threshold", 0.025))
     constraints = cfg.get("constraints", {})
     entries = {int(entry["id"]): np.asarray(entry["vector"], dtype=np.float32) for entry in codebook.get("entries", [])}
-    all_ids = sorted(entries.keys())
+    all_ids = sorted(entries)
     groups: dict[str, dict[str, object]] = defaultdict(_oracle_group_template)
     enriched: list[dict[str, object]] = []
 
@@ -731,12 +733,9 @@ def attach_oracle_code_targets(
         action_topo = item["action_topo"]
         topo_list = [int(value) for value in action_topo.detach().cpu().view(-1).tolist()] if hasattr(action_topo, "detach") else [int(value) for value in action_topo]
         allowed_ids = allowed_code_ids_for_context(
-            codebook,
-            family_name=family_name,
-            step_role=step_role,
+            codebook, family_name=family_name, step_role=step_role,
             step_index=int(item.get("step_index", 0)),
-            action_topo=topo_list,
-            topology_signature=item.get("topology_signature"),
+            action_topo=topo_list, topology_signature=item.get("topology_signature"),
         )
         if not allowed_ids:
             allowed_ids = list(all_ids)
@@ -755,10 +754,7 @@ def attach_oracle_code_targets(
             if code_id not in entries:
                 continue
             is_valid, reason, candidate_geo = _apply_code_vector_for_oracle(
-                item["base_data"],
-                topo_list,
-                entries[code_id],
-                constraints,
+                item["base_data"], topo_list, entries[code_id], constraints,
             )
             if not is_valid or candidate_geo is None:
                 invalid_ids.append(code_id)
@@ -784,24 +780,26 @@ def attach_oracle_code_targets(
         new_item["oracle_invalid_reason_counts"] = dict(invalid_reasons)
         new_item["best_valid_code_id"] = int(best_valid_id)
         new_item["best_valid_code_error"] = float(best_valid_error) if np.isfinite(best_valid_error) else None
-        new_item["oracle_uncovered"] = len(positive_ids) == 0
+        new_item["oracle_uncovered"] = not positive_ids
         enriched.append(new_item)
 
         for key in ("overall", family_name, f"{family_name}/step{int(item.get('step_index', 0))}"):
             group = groups[key]
             group["count"] = int(group["count"]) + 1
-            group["oracle_positive"] = int(group["oracle_positive"]) + int(len(positive_ids) > 0)
-            group["valid_code_available"] = int(group["valid_code_available"]) + int(len(valid_ids) > 0)
-            group["oracle_uncovered"] = int(group["oracle_uncovered"]) + int(len(positive_ids) == 0)
+            group["oracle_positive"] = int(group["oracle_positive"]) + int(bool(positive_ids))
+            group["valid_code_available"] = int(group["valid_code_available"]) + int(bool(valid_ids))
+            group["oracle_uncovered"] = int(group["oracle_uncovered"]) + int(not positive_ids)
 
     return enriched, {key: _finalise_oracle_group(value) for key, value in sorted(groups.items())}
 
 
 def _zero_like_loss(logits: torch.Tensor) -> torch.Tensor:
+    """返回与 logits 同设备的零标量。"""
     return logits.sum() * 0.0
 
 
 def _oracle_batch_field(batch: dict, key: str, logits: torch.Tensor, default: torch.Tensor) -> torch.Tensor:
+    """从 batch 中获取 Oracle 字段，不存在时返回 default。"""
     value = batch.get(key)
     if value is None:
         return default.to(logits.device)
@@ -813,6 +811,7 @@ def compute_oracle_code_loss(
     batch: dict[str, torch.Tensor | Data],
     cfg: dict,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """计算 Oracle 码损失：硬 CE + 软 CE + 成对排序 + 有效性间隔。"""
     il_cfg = cfg.get("il_training", {})
     oracle_cfg = dict(il_cfg.get("oracle_code_loss", {}) or {})
     targets = batch["action_code_id"].long().to(logits.device)
@@ -829,36 +828,11 @@ def compute_oracle_code_loss(
             "oracle_best_valid_available_rate": zero.detach(),
         }
 
-    positive_mask = _oracle_batch_field(
-        batch,
-        "oracle_positive_mask",
-        logits,
-        torch.zeros_like(logits, dtype=torch.bool),
-    ).bool()
-    soft_targets = _oracle_batch_field(
-        batch,
-        "oracle_soft_targets",
-        logits,
-        torch.zeros_like(logits, dtype=torch.float32),
-    ).float()
-    valid_mask = _oracle_batch_field(
-        batch,
-        "oracle_valid_mask",
-        logits,
-        torch.zeros_like(logits, dtype=torch.bool),
-    ).bool()
-    best_valid = _oracle_batch_field(
-        batch,
-        "oracle_best_valid_code_id",
-        logits,
-        torch.full((logits.size(0),), -1, dtype=torch.long, device=logits.device),
-    ).long()
-    uncovered = _oracle_batch_field(
-        batch,
-        "oracle_uncovered",
-        logits,
-        torch.ones((logits.size(0),), dtype=torch.bool, device=logits.device),
-    ).bool()
+    positive_mask = _oracle_batch_field(batch, "oracle_positive_mask", logits, torch.zeros_like(logits, dtype=torch.bool)).bool()
+    soft_targets = _oracle_batch_field(batch, "oracle_soft_targets", logits, torch.zeros_like(logits, dtype=torch.float32)).float()
+    valid_mask = _oracle_batch_field(batch, "oracle_valid_mask", logits, torch.zeros_like(logits, dtype=torch.bool)).bool()
+    best_valid = _oracle_batch_field(batch, "oracle_best_valid_code_id", logits, torch.full((logits.size(0),), -1, dtype=torch.long, device=logits.device)).long()
+    uncovered = _oracle_batch_field(batch, "oracle_uncovered", logits, torch.ones((logits.size(0),), dtype=torch.bool, device=logits.device)).bool()
     covered = (~uncovered) & positive_mask.any(dim=-1)
     finite_mask = logits > -1.0e8
     zero = _zero_like_loss(logits)
@@ -916,6 +890,7 @@ def constrained_code_choice(
     codebook: torch.Tensor,
     constraint_cfg: dict | None,
 ) -> dict[str, object]:
+    """按优先级遍历候选码本，选择第一个几何有效的码。"""
     ordered = [int(idx) for idx in ordered_code_ids]
     if not ordered:
         return {"code_id": -1, "valid": False, "used_non_top1": False, "invalid_reason": "empty_candidates"}
@@ -928,19 +903,13 @@ def constrained_code_choice(
         is_valid, reason, _ = _apply_code_vector_for_oracle(graph, action_topo, vector, constraint_cfg)
         if is_valid:
             return {
-                "code_id": int(code_id),
-                "valid": True,
-                "used_non_top1": bool(rank > 0),
-                "rank": int(rank + 1),
-                "invalid_reason": None,
+                "code_id": int(code_id), "valid": True,
+                "used_non_top1": bool(rank > 0), "rank": int(rank + 1), "invalid_reason": None,
             }
         last_reason = reason
     return {
-        "code_id": int(ordered[0]),
-        "valid": False,
-        "used_non_top1": False,
-        "rank": 1,
-        "invalid_reason": last_reason,
+        "code_id": int(ordered[0]), "valid": False, "used_non_top1": False,
+        "rank": 1, "invalid_reason": last_reason,
     }
 
 
@@ -950,6 +919,7 @@ def compute_phase4_losses(
     z_c: torch.Tensor,
     cfg: dict,
 ):
+    """计算 Phase4 多步 IL 全部损失：拓扑 NLL(u/v/w) + 几何码 CE + 停止 BCE + 步角色/步数 CE + 可选 Oracle 码损失。"""
     il_cfg = cfg.get("il_training", {})
     base_data = batch["base_data"]
     action_topo = batch["action_topo"]
@@ -958,28 +928,19 @@ def compute_phase4_losses(
 
     x_enc = policy.encode_graph(base_data)
     phase4_outputs = policy.phase4_outputs(
-        base_data,
-        x_enc,
-        z_c,
+        base_data, x_enc, z_c,
         family_ids=batch["family_index"],
         step_indices=batch["step_index"],
         step_counts=batch["step_count"],
     )
     global_action = action_topo.to(offsets.device) + offsets.unsqueeze(1)
     code_logits = policy.geometry_code_logits(
-        base_data,
-        x_enc,
-        phase4_outputs["graph_context"],
-        action_topo,
+        base_data, x_enc, phase4_outputs["graph_context"], action_topo,
     )
     action_code_targets = batch["action_code_id"].long()
     code_mask = _code_bucket_mask(
-        policy,
-        batch["family_index"],
-        batch["step_role_index"],
-        action_code_targets,
-        action_topos=action_topo,
-        step_indices=batch["step_index"],
+        policy, batch["family_index"], batch["step_role_index"],
+        action_code_targets, action_topos=action_topo, step_indices=batch["step_index"],
     )
     masked_code_logits = code_logits.masked_fill(~code_mask, -1e9)
 
@@ -987,28 +948,10 @@ def compute_phase4_losses(
     moving_mask = ~is_fixed
     fixed_mask = is_fixed
 
-    loss_u = _masked_group_nll_loss(
-        phase4_outputs["u_logits"],
-        batch_index,
-        moving_mask,
-        global_action[:, 0],
-    )
-    loss_v = _masked_group_nll_loss(
-        phase4_outputs["v_logits"],
-        batch_index,
-        moving_mask,
-        global_action[:, 1],
-    )
-    loss_w = _masked_group_nll_loss(
-        phase4_outputs["w_logits"],
-        batch_index,
-        fixed_mask,
-        global_action[:, 2],
-    )
-    loss_stop = F.binary_cross_entropy_with_logits(
-        phase4_outputs["stop_logits"].view(-1),
-        batch["stop_token"].view(-1),
-    )
+    loss_u = _masked_group_nll_loss(phase4_outputs["u_logits"], batch_index, moving_mask, global_action[:, 0])
+    loss_v = _masked_group_nll_loss(phase4_outputs["v_logits"], batch_index, moving_mask, global_action[:, 1])
+    loss_w = _masked_group_nll_loss(phase4_outputs["w_logits"], batch_index, fixed_mask, global_action[:, 2])
+    loss_stop = F.binary_cross_entropy_with_logits(phase4_outputs["stop_logits"].view(-1), batch["stop_token"].view(-1))
     loss_step_role = F.cross_entropy(phase4_outputs["step_role_logits"], batch["step_role_index"])
     loss_step_count = F.cross_entropy(
         phase4_outputs["step_count_logits"],
@@ -1106,6 +1049,7 @@ def compute_phase4_losses(
 
 
 def group_paths_by_trace(paths: Sequence[dict[str, object]]) -> list[list[dict[str, object]]]:
+    """按 trace_id 分组并按 step_index 排序。"""
     grouped: dict[int, list[dict[str, object]]] = defaultdict(list)
     for item in paths:
         grouped[int(item["trace_id"])].append(item)
@@ -1113,6 +1057,7 @@ def group_paths_by_trace(paths: Sequence[dict[str, object]]) -> list[list[dict[s
 
 
 def scheduled_sampling_ratio(stage_cfg: dict, *, epoch: int, total_epochs: int) -> float:
+    """计算 rollout 感知训练的采样比例（线性插值）。"""
     rollout_cfg = stage_cfg.get("rollout_aware", {}) or {}
     if not bool(rollout_cfg.get("enabled", False)):
         return 0.0
@@ -1128,13 +1073,16 @@ def scheduled_sampling_ratio(stage_cfg: dict, *, epoch: int, total_epochs: int) 
 
 
 def _target_curves_for_step(step: dict[str, object], device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    target_foot = step["y_foot"].unsqueeze(0).to(device)
-    target_knee = step["y_knee"].unsqueeze(0).to(device)
-    target_ankle = step["y_ankle"].unsqueeze(0).to(device)
-    return target_foot, target_knee, target_ankle
+    """提取单步的目标曲线并转移到设备。"""
+    return (
+        step["y_foot"].unsqueeze(0).to(device),
+        step["y_knee"].unsqueeze(0).to(device),
+        step["y_ankle"].unsqueeze(0).to(device),
+    )
 
 
 def _encode_step_target(policy, curve_encoder, step: dict[str, object], device) -> torch.Tensor:
+    """编码单步的目标曲线为潜在向量。"""
     target_foot, target_knee, target_ankle = _target_curves_for_step(step, device)
     if curve_encoder is None:
         latent_dim = int(getattr(policy, "curve_latent_dim", 128))
@@ -1143,6 +1091,7 @@ def _encode_step_target(policy, curve_encoder, step: dict[str, object], device) 
 
 
 def _truth_action_valid_on_graph(graph: Data, step: dict[str, object], cfg: dict) -> tuple[bool, str | None]:
+    """检查专家动作在当前图上是否仍然有效。"""
     topo = step["action_topo"].detach().cpu().view(-1).long()
     if topo.numel() != 3:
         return False, "truth_action_topology_malformed"
@@ -1176,6 +1125,7 @@ def _truth_action_valid_on_graph(graph: Data, step: dict[str, object], cfg: dict
 
 
 def _apply_predicted_step(policy, graph: Data, pred: dict[str, int], cfg: dict) -> tuple[Data | None, str | None]:
+    """应用预测动作到图上，返回 (next_graph, invalid_reason)。"""
     try:
         node_count = int(graph.pos.size(0))
         if min(int(pred["u"]), int(pred["v"]), int(pred["w"])) < 0 or max(int(pred["u"]), int(pred["v"]), int(pred["w"])) >= node_count:
@@ -1187,12 +1137,8 @@ def _apply_predicted_step(policy, graph: Data, pred: dict[str, int], cfg: dict) 
             policy.action_codebook[int(pred["code"])].detach().cpu().numpy(),
         )
         next_graph = apply_j_operator(
-            graph,
-            int(pred["u"]),
-            int(pred["v"]),
-            int(pred["w"]),
-            pred_geo[0],
-            pred_geo[1],
+            graph, int(pred["u"]), int(pred["v"]), int(pred["w"]),
+            pred_geo[0], pred_geo[1],
         )
         is_valid, reason = validate_graph_structure(next_graph, cfg.get("constraints", {}))
         if not bool(is_valid):
@@ -1211,6 +1157,7 @@ def _candidate_rollout_code_ids(
     *,
     max_codes: int,
 ) -> list[int]:
+    """获取 rollout 重排的候选码 ID 列表（top-K + 预测码）。"""
     if max_codes <= 0 or not hasattr(policy, "geometry_code_logits"):
         return [int(pred["code"])]
     batch_graph = rollout_prediction.get("batch_graph")
@@ -1228,11 +1175,8 @@ def _candidate_rollout_code_ids(
         family_name = family_name_from_index(int(step["family_index"]))
         step_role = INDEX_TO_STEP_ROLE.get(int(step["step_role_index"]), str(step.get("step_role", "semantic")))
         bucket = resolve_codebook_bucket_for_step(
-            allowed_map,
-            family_name,
-            step_role,
-            step_index=int(step["step_index"]),
-            action_topo=action_topo[0],
+            allowed_map, family_name, step_role,
+            step_index=int(step["step_index"]), action_topo=action_topo[0],
         )
         allowed_ids = allowed_map.get(bucket, [])
         if allowed_ids:
@@ -1250,17 +1194,14 @@ def _candidate_rollout_code_ids(
 
 
 def _rollout_aware_cfg(cfg: dict) -> dict:
+    """获取 rollout 感知训练配置。"""
     return ((cfg.get("il_training", {}) or {}).get("rollout_aware", {}) or {})
 
 
 def _apply_predicted_step_with_optional_rerank(
-    policy,
-    current_graph: Data,
-    rollout_prediction: dict[str, object],
-    step: dict[str, object],
-    cfg: dict,
-    device,
+    policy, current_graph, rollout_prediction, step, cfg, device,
 ) -> tuple[Data | None, dict[str, int], str | None, bool, bool]:
+    """应用预测动作，失败时尝试 validity rerank。返回 (next_graph, pred, reason, rerank_used, rerank_failed)。"""
     pred = dict(rollout_prediction["pred"])
     next_graph, invalid_reason = _apply_predicted_step(policy, current_graph, pred, cfg)
     if next_graph is not None:
@@ -1271,11 +1212,7 @@ def _apply_predicted_step_with_optional_rerank(
         return None, pred, invalid_reason, False, False
 
     candidate_codes = _candidate_rollout_code_ids(
-        policy,
-        rollout_prediction,
-        pred,
-        step,
-        device,
+        policy, rollout_prediction, pred, step, device,
         max_codes=int(rollout_cfg.get("max_rerank_codes", 10)),
     )
     for code_id in candidate_codes:
@@ -1291,15 +1228,10 @@ def _apply_predicted_step_with_optional_rerank(
 
 
 def generate_rollout_aware_samples(
-    policy,
-    curve_encoder,
-    paths: Sequence[dict[str, object]],
-    cfg: dict,
-    device,
-    *,
-    max_traces: int | None = None,
-    max_samples: int | None = None,
+    policy, curve_encoder, paths, cfg, device,
+    *, max_traces=None, max_samples=None,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """生成 Rollout 感知的增强训练数据。当策略 rollout 上专家动作仍有效时加入训练集。"""
     traces = group_paths_by_trace(paths)
     if max_traces is not None:
         traces = traces[: max(0, int(max_traces))]
@@ -1351,24 +1283,16 @@ def generate_rollout_aware_samples(
                     else:
                         drop_reasons["truth_action_invalid_on_rollout_graph"] += 1
                         if len(examples) < max_examples:
-                            examples.append(
-                                {
-                                    "trace_id": trace_id,
-                                    "family": family_name,
-                                    "step_index": int(step["step_index"]),
-                                    "drop_reason": "truth_action_invalid_on_rollout_graph",
-                                    "invalid_reason": invalid_reason,
-                                }
-                            )
+                            examples.append({
+                                "trace_id": trace_id, "family": family_name,
+                                "step_index": int(step["step_index"]),
+                                "drop_reason": "truth_action_invalid_on_rollout_graph",
+                                "invalid_reason": invalid_reason,
+                            })
 
                 rollout_prediction = _phase4_step_prediction(policy, current_graph, z_c, step, device)
                 next_graph, pred, invalid_reason, rerank_used, rerank_no_valid = _apply_predicted_step_with_optional_rerank(
-                    policy,
-                    current_graph,
-                    rollout_prediction,
-                    step,
-                    cfg,
-                    device,
+                    policy, current_graph, rollout_prediction, step, cfg, device,
                 )
                 rerank_used_count += int(rerank_used)
                 rerank_no_valid_code_count += int(rerank_no_valid)
@@ -1377,16 +1301,12 @@ def generate_rollout_aware_samples(
                 if next_graph is None:
                     drop_reasons["predicted_rollout_invalid_or_failed"] += 1
                     if len(examples) < max_examples:
-                        examples.append(
-                            {
-                                "trace_id": trace_id,
-                                "family": family_name,
-                                "step_index": int(step["step_index"]),
-                                "drop_reason": "predicted_rollout_invalid_or_failed",
-                                "invalid_reason": invalid_reason,
-                                "pred": pred,
-                            }
-                        )
+                        examples.append({
+                            "trace_id": trace_id, "family": family_name,
+                            "step_index": int(step["step_index"]),
+                            "drop_reason": "predicted_rollout_invalid_or_failed",
+                            "invalid_reason": invalid_reason, "pred": pred,
+                        })
                     break
                 current_graph = next_graph
 
@@ -1402,24 +1322,16 @@ def generate_rollout_aware_samples(
 
 
 def evaluate_multistep_reconstruction(
-    policy,
-    curve_encoder,
-    paths: Sequence[dict[str, object]],
-    cfg: dict,
-    device,
-    *,
-    max_traces: int | None = None,
+    policy, curve_encoder, paths, cfg, device,
+    *, max_traces=None,
 ) -> dict[str, object]:
+    """评估多步重建成功率：自回归 rollout 并检查精确重建。"""
     traces = group_paths_by_trace(paths)
     if max_traces is not None:
         traces = traces[: max(0, int(max_traces))]
     if not traces:
-        return {
-            "trace_count": 0,
-            "valid_reconstruction_rate": 0.0,
-            "reconstruction_success_rate": 0.0,
-            "family_success_rate": {},
-        }
+        return {"trace_count": 0, "valid_reconstruction_rate": 0.0,
+                "reconstruction_success_rate": 0.0, "family_success_rate": {}}
 
     policy.eval()
     if curve_encoder is not None:
@@ -1449,9 +1361,7 @@ def evaluate_multistep_reconstruction(
                 batch_graph = Batch.from_data_list([current_graph]).to(device)
                 x_enc = policy.encode_graph(batch_graph)
                 outputs = policy.phase4_outputs(
-                    batch_graph,
-                    x_enc,
-                    z_c,
+                    batch_graph, x_enc, z_c,
                     family_ids=torch.tensor([int(step["family_index"])], dtype=torch.long, device=device),
                     step_indices=torch.tensor([int(step["step_index"])], dtype=torch.long, device=device),
                     step_counts=torch.tensor([int(step["step_count"])], dtype=torch.long, device=device),
@@ -1471,9 +1381,7 @@ def evaluate_multistep_reconstruction(
 
                 pred_code = int(
                     policy.predict_geometry_code(
-                        batch_graph,
-                        x_enc,
-                        outputs["graph_context"],
+                        batch_graph, x_enc, outputs["graph_context"],
                         torch.tensor([[pred_u, pred_v, pred_w]], dtype=torch.long, device=device),
                         family_ids=torch.tensor([int(step["family_index"])], dtype=torch.long, device=device),
                         step_roles=torch.tensor([int(step["step_role_index"])], dtype=torch.long, device=device),
@@ -1488,14 +1396,7 @@ def evaluate_multistep_reconstruction(
                         current_graph.pos[pred_w].detach().cpu().numpy(),
                         policy.action_codebook[pred_code].detach().cpu().numpy(),
                     )
-                    next_graph = apply_j_operator(
-                        current_graph,
-                        pred_u,
-                        pred_v,
-                        pred_w,
-                        pred_geo[0],
-                        pred_geo[1],
-                    )
+                    next_graph = apply_j_operator(current_graph, pred_u, pred_v, pred_w, pred_geo[0], pred_geo[1])
                 except Exception:
                     trace_valid = False
                     trace_success = False
@@ -1511,10 +1412,7 @@ def evaluate_multistep_reconstruction(
             success_flags.append(float(trace_success))
             family_flags[family_name].append(float(trace_success))
 
-    family_success = {
-        family_name: float(np.mean(flags))
-        for family_name, flags in sorted(family_flags.items())
-    }
+    family_success = {family_name: float(np.mean(flags)) for family_name, flags in sorted(family_flags.items())}
     return {
         "trace_count": len(traces),
         "valid_reconstruction_rate": float(np.mean(valid_flags)),
@@ -1524,12 +1422,11 @@ def evaluate_multistep_reconstruction(
 
 
 def _phase4_step_prediction(policy, graph: Data, z_c: torch.Tensor, step: dict[str, object], device) -> dict[str, object]:
+    """对单步执行 Phase4 预测，返回编码结果和预测动作。"""
     batch_graph = Batch.from_data_list([copy.deepcopy(graph)]).to(device)
     x_enc = policy.encode_graph(batch_graph)
     outputs = policy.phase4_outputs(
-        batch_graph,
-        x_enc,
-        z_c,
+        batch_graph, x_enc, z_c,
         family_ids=torch.tensor([int(step["family_index"])], dtype=torch.long, device=device),
         step_indices=torch.tensor([int(step["step_index"])], dtype=torch.long, device=device),
         step_counts=torch.tensor([int(step["step_count"])], dtype=torch.long, device=device),
@@ -1542,31 +1439,24 @@ def _phase4_step_prediction(policy, graph: Data, z_c: torch.Tensor, step: dict[s
     pred_role = int(torch.argmax(outputs["step_role_logits"], dim=-1)[0].item())
     pred_code = int(
         policy.predict_geometry_code(
-            batch_graph,
-            x_enc,
-            outputs["graph_context"],
-        torch.tensor([[pred_u, pred_v, pred_w]], dtype=torch.long, device=device),
-        family_ids=torch.tensor([int(step["family_index"])], dtype=torch.long, device=device),
-        step_roles=torch.tensor([int(step["step_role_index"])], dtype=torch.long, device=device),
-        step_indices=torch.tensor([int(step["step_index"])], dtype=torch.long, device=device),
-    )[0].item()
+            batch_graph, x_enc, outputs["graph_context"],
+            torch.tensor([[pred_u, pred_v, pred_w]], dtype=torch.long, device=device),
+            family_ids=torch.tensor([int(step["family_index"])], dtype=torch.long, device=device),
+            step_roles=torch.tensor([int(step["step_role_index"])], dtype=torch.long, device=device),
+            step_indices=torch.tensor([int(step["step_index"])], dtype=torch.long, device=device),
+        )[0].item()
     )
     return {
         "batch_graph": batch_graph,
         "x_enc": x_enc,
         "graph_context": outputs["graph_context"],
-        "pred": {
-            "u": int(pred_u),
-            "v": int(pred_v),
-            "w": int(pred_w),
-            "code": int(pred_code),
-            "stop": int(pred_stop),
-            "role": int(pred_role),
-        },
+        "pred": {"u": int(pred_u), "v": int(pred_v), "w": int(pred_w),
+                 "code": int(pred_code), "stop": int(pred_stop), "role": int(pred_role)},
     }
 
 
 def _truth_step_payload(step: dict[str, object]) -> dict[str, int]:
+    """提取专家步的真实动作字典。"""
     return {
         "u": int(step["action_topo"][0].item()),
         "v": int(step["action_topo"][1].item()),
@@ -1578,6 +1468,7 @@ def _truth_step_payload(step: dict[str, object]) -> dict[str, int]:
 
 
 def _prediction_matches(pred: dict[str, int], truth: dict[str, int]) -> dict[str, bool]:
+    """比较预测与真实动作的各分量匹配情况。"""
     topology_match = (
         int(pred["u"]) == int(truth["u"])
         and int(pred["v"]) == int(truth["v"])
@@ -1592,11 +1483,10 @@ def _prediction_matches(pred: dict[str, int], truth: dict[str, int]) -> dict[str
 
 
 def _matches_are_clean(matches: dict[str, bool]) -> bool:
+    """检查所有分量是否完全匹配。"""
     return bool(
-        matches["topology_match"]
-        and matches["code_match"]
-        and matches["stop_match"]
-        and matches["role_match"]
+        matches["topology_match"] and matches["code_match"]
+        and matches["stop_match"] and matches["role_match"]
     )
 
 
@@ -1607,6 +1497,7 @@ def _classify_step_failure(
     truth_graph_matches: dict[str, bool],
     invalid_graph: bool,
 ) -> str:
+    """分类单步失败原因。"""
     if prior_step_failed and _matches_are_clean(truth_graph_matches) and not _matches_are_clean(matches):
         return "state_drift_after_prior_error"
     if not matches["topology_match"]:
@@ -1622,36 +1513,23 @@ def _classify_step_failure(
 
 def _empty_family_failure_summary() -> dict[str, object]:
     return {
-        "trace_count": 0,
-        "valid_reconstruction_rate": 0.0,
-        "reconstruction_success_rate": 0.0,
-        "first_failure_type_counts": {},
-        "step_failure_type_counts": {},
+        "trace_count": 0, "valid_reconstruction_rate": 0.0, "reconstruction_success_rate": 0.0,
+        "first_failure_type_counts": {}, "step_failure_type_counts": {},
     }
 
 
 def evaluate_multistep_reconstruction_detailed(
-    policy,
-    curve_encoder,
-    paths: Sequence[dict[str, object]],
-    cfg: dict,
-    device,
-    *,
-    max_traces: int | None = None,
-    max_failure_examples_per_family: int = 20,
+    policy, curve_encoder, paths, cfg, device,
+    *, max_traces=None, max_failure_examples_per_family=20,
 ) -> dict[str, object]:
+    """详细评估多步重建，分类失败原因并记录失败示例。"""
     traces = group_paths_by_trace(paths)
     if max_traces is not None:
         traces = traces[: max(0, int(max_traces))]
     if not traces:
         return {
-            "trace_count": 0,
-            "valid_reconstruction_rate": 0.0,
-            "reconstruction_success_rate": 0.0,
-            "by_family": {},
-            "by_family_step": {},
-            "first_failure_type_counts": {},
-            "failure_examples": [],
+            "trace_count": 0, "valid_reconstruction_rate": 0.0, "reconstruction_success_rate": 0.0,
+            "by_family": {}, "by_family_step": {}, "first_failure_type_counts": {}, "failure_examples": [],
         }
 
     policy.eval()
@@ -1662,12 +1540,7 @@ def evaluate_multistep_reconstruction_detailed(
     success_flags: list[float] = []
     first_failure_type_counts: Counter[str] = Counter()
     by_family_flags: dict[str, dict[str, list[float] | Counter[str]]] = defaultdict(
-        lambda: {
-            "valid": [],
-            "success": [],
-            "first_failure_type_counts": Counter(),
-            "step_failure_type_counts": Counter(),
-        }
+        lambda: {"valid": [], "success": [], "first_failure_type_counts": Counter(), "step_failure_type_counts": Counter()}
     )
     by_family_step_counts: dict[str, Counter[str]] = defaultdict(Counter)
     by_family_step_total: Counter[str] = Counter()
@@ -1716,14 +1589,7 @@ def evaluate_multistep_reconstruction_detailed(
                         current_graph.pos[pred["w"]].detach().cpu().numpy(),
                         policy.action_codebook[pred["code"]].detach().cpu().numpy(),
                     )
-                    next_graph = apply_j_operator(
-                        current_graph,
-                        pred["u"],
-                        pred["v"],
-                        pred["w"],
-                        pred_geo[0],
-                        pred_geo[1],
-                    )
+                    next_graph = apply_j_operator(current_graph, pred["u"], pred["v"], pred["w"], pred_geo[0], pred_geo[1])
                     is_valid, reason = validate_graph_structure(next_graph, cfg.get("constraints", {}))
                     invalid_graph = not bool(is_valid)
                     invalid_reason = None if is_valid else str(reason)
@@ -1732,10 +1598,8 @@ def evaluate_multistep_reconstruction_detailed(
                     invalid_reason = str(exc)
 
                 failure_type = _classify_step_failure(
-                    matches,
-                    prior_step_failed=prior_step_failed,
-                    truth_graph_matches=truth_graph_matches,
-                    invalid_graph=invalid_graph,
+                    matches, prior_step_failed=prior_step_failed,
+                    truth_graph_matches=truth_graph_matches, invalid_graph=invalid_graph,
                 )
                 step_failed = failure_type != "success"
                 if step_failed:
@@ -1744,28 +1608,21 @@ def evaluate_multistep_reconstruction_detailed(
                     if first_failure_type is None:
                         first_failure_type = failure_type
                     if examples_by_family[family_name] < int(max_failure_examples_per_family):
-                        failure_examples.append(
-                            {
-                                "trace_id": trace_id,
-                                "family": family_name,
-                                "step_index": step_index,
-                                "step_role": step_role,
-                                "truth": truth,
-                                "pred": pred,
-                                "truth_graph_pred": truth_graph_pred,
-                                "topology_match": matches["topology_match"],
-                                "code_match": matches["code_match"],
-                                "stop_match": matches["stop_match"],
-                                "role_match": matches["role_match"],
-                                "prior_step_failed": prior_step_failed_before_step,
-                                "truth_graph_topology_match": truth_graph_matches["topology_match"],
-                                "truth_graph_code_match": truth_graph_matches["code_match"],
-                                "truth_graph_stop_match": truth_graph_matches["stop_match"],
-                                "truth_graph_role_match": truth_graph_matches["role_match"],
-                                "invalid_reason": invalid_reason,
-                                "failure_type": failure_type,
-                            }
-                        )
+                        failure_examples.append({
+                            "trace_id": trace_id, "family": family_name,
+                            "step_index": step_index, "step_role": step_role,
+                            "truth": truth, "pred": pred, "truth_graph_pred": truth_graph_pred,
+                            "topology_match": matches["topology_match"],
+                            "code_match": matches["code_match"],
+                            "stop_match": matches["stop_match"],
+                            "role_match": matches["role_match"],
+                            "prior_step_failed": prior_step_failed_before_step,
+                            "truth_graph_topology_match": truth_graph_matches["topology_match"],
+                            "truth_graph_code_match": truth_graph_matches["code_match"],
+                            "truth_graph_stop_match": truth_graph_matches["stop_match"],
+                            "truth_graph_role_match": truth_graph_matches["role_match"],
+                            "invalid_reason": invalid_reason, "failure_type": failure_type,
+                        })
                         examples_by_family[family_name] += 1
 
                 step_key = f"{family_name}/step{step_index}"
@@ -1821,15 +1678,10 @@ def evaluate_multistep_reconstruction_detailed(
 
 
 def evaluate_constrained_decoder_reconstruction(
-    policy,
-    curve_encoder,
-    paths: Sequence[dict[str, object]],
-    cfg: dict,
-    device,
-    *,
-    top_k: int = 10,
-    max_traces: int | None = None,
+    policy, curve_encoder, paths, cfg, device,
+    *, top_k=10, max_traces=None,
 ) -> dict[str, object]:
+    """评估约束解码器重建：使用 validity rerank 选择有效码本条目。"""
     traces = group_paths_by_trace(paths)
     if max_traces is not None:
         traces = traces[: max(0, int(max_traces))]
@@ -1842,11 +1694,8 @@ def evaluate_constrained_decoder_reconstruction(
 
     by_family: dict[str, dict[str, int]] = defaultdict(
         lambda: {
-            "trace_count": 0,
-            "top1_valid_trace": 0,
-            "constrained_valid_trace": 0,
-            "constrained_oracle_equiv_trace": 0,
-            "constrained_success_trace": 0,
+            "trace_count": 0, "top1_valid_trace": 0, "constrained_valid_trace": 0,
+            "constrained_oracle_equiv_trace": 0, "constrained_success_trace": 0,
             "constrained_used_non_top1_trace": 0,
         }
     )
@@ -1875,28 +1724,17 @@ def evaluate_constrained_decoder_reconstruction(
                 )
 
                 top1_choice = constrained_code_choice(
-                    current_graph,
-                    pred_topo,
-                    [int(pred["code"])],
-                    policy.action_codebook,
-                    cfg.get("constraints", {}),
+                    current_graph, pred_topo, [int(pred["code"])],
+                    policy.action_codebook, cfg.get("constraints", {}),
                 )
                 top1_valid_trace = bool(top1_valid_trace and top1_choice["valid"])
 
                 candidate_codes = _candidate_rollout_code_ids(
-                    policy,
-                    rollout_prediction,
-                    pred,
-                    step,
-                    device,
-                    max_codes=int(top_k),
+                    policy, rollout_prediction, pred, step, device, max_codes=int(top_k),
                 )
                 constrained_choice = constrained_code_choice(
-                    current_graph,
-                    pred_topo,
-                    candidate_codes,
-                    policy.action_codebook,
-                    cfg.get("constraints", {}),
+                    current_graph, pred_topo, candidate_codes,
+                    policy.action_codebook, cfg.get("constraints", {}),
                 )
                 used_non_top1_trace = bool(used_non_top1_trace or constrained_choice["used_non_top1"])
                 constrained_valid_trace = bool(constrained_valid_trace and constrained_choice["valid"])
@@ -1941,13 +1779,10 @@ def evaluate_constrained_decoder_reconstruction(
             "constrained_reconstruction_success_rate": float(payload["constrained_success_trace"] / trace_count),
             "constrained_used_non_top1_trace_rate": float(payload["constrained_used_non_top1_trace"] / trace_count),
         }
-    return {
-        "trace_count": int(len(traces)),
-        "top_k": int(top_k),
-        "by_family": family_report,
-    }
+    return {"trace_count": int(len(traces)), "top_k": int(top_k), "by_family": family_report}
 
 
 def _single_graph_prediction(logits: torch.Tensor, valid_mask: torch.Tensor) -> int:
+    """在单图的有效位置上取 argmax。"""
     masked = logits.view(-1).masked_fill(~valid_mask.view(-1), -1e9)
     return int(torch.argmax(masked).item())

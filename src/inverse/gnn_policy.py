@@ -1,3 +1,6 @@
+# GNN 策略网络：基于图神经网络的机构综合逆向设计策略，支持 IL/RL/推理。
+# 包含 GNN 编码器、拓扑评分、动作预测 (u/v/w)、几何码预测和 CVAE 几何生成头。
+
 from __future__ import annotations
 
 import torch
@@ -6,10 +9,12 @@ from torch_geometric.utils import scatter
 
 from src.layers_encoder import GNNEncoder
 
+# 模型加载时可选缺失的键集合（旧版模型兼容）
 OPTIONAL_POLICY_MISSING_KEYS = {
     "geo_head.prior_bias_scale",
     "action_codebook",
 }
+
 OPTIONAL_POLICY_MISSING_PREFIXES = (
     "geo_head.prior_bias.",
     "family_embedding.",
@@ -28,6 +33,7 @@ OPTIONAL_POLICY_MISSING_PREFIXES = (
 
 
 def filter_optional_policy_missing_keys(missing_keys):
+    """从缺失键列表中移除可选键，仅返回真正缺失的必需键。"""
     return [
         key for key in missing_keys
         if key not in OPTIONAL_POLICY_MISSING_KEYS
@@ -36,13 +42,18 @@ def filter_optional_policy_missing_keys(missing_keys):
 
 
 def policy_load_incompatibilities(load_result):
+    """分析加载结果，返回 (过滤后的缺失键, 意外键)。"""
     missing = filter_optional_policy_missing_keys(load_result.missing_keys)
     unexpected = list(load_result.unexpected_keys)
     return missing, unexpected
 
 
 class GeometryHead(nn.Module):
-    """Conditional VAE head for dyad geometry generation."""
+    """CVAE 几何生成头：编码器将 (x_true, condition) 映射为潜在分布 (mu, logvar)，
+    解码器将 (z, condition) 解码为几何参数，先验偏置提供基线估计。
+
+    输出维度为 4（dyad 的 4 个几何参数），潜在空间维度默认 64。
+    """
 
     def __init__(
         self,
@@ -52,70 +63,75 @@ class GeometryHead(nn.Module):
         prior_bias_init: float = 0.10,
         prior_bias_max: float = 0.50,
     ):
+        """初始化 CVAE 几何头。condition_dim 为条件向量维度，latent_dim 为潜在空间维度。"""
         super().__init__()
         self.latent_dim = latent_dim
         self.prior_bias_max = float(prior_bias_max)
 
+        # 编码器: (x_true, condition) -> (mu, logvar)
         enc_in = output_dim + condition_dim
         self.encoder = nn.Sequential(
-            nn.Linear(enc_in, 128),
-            nn.ELU(),
-            nn.Linear(128, 64),
-            nn.ELU(),
+            nn.Linear(enc_in, 128), nn.ELU(),
+            nn.Linear(128, 64), nn.ELU(),
         )
         self.fc_mu = nn.Linear(64, latent_dim)
         self.fc_logvar = nn.Linear(64, latent_dim)
 
+        # 解码器: (z, condition) -> 几何参数
         dec_in = latent_dim + condition_dim
         self.decoder = nn.Sequential(
-            nn.Linear(dec_in, 128),
-            nn.ELU(),
-            nn.Linear(128, 64),
-            nn.ELU(),
+            nn.Linear(dec_in, 128), nn.ELU(),
+            nn.Linear(128, 64), nn.ELU(),
             nn.Linear(64, output_dim),
         )
+        # 先验偏置网络: 从条件向量估计基线几何参数
         self.prior_bias = nn.Sequential(
-            nn.Linear(condition_dim, 64),
-            nn.ELU(),
-            nn.Linear(64, output_dim),
-            nn.Tanh(),
+            nn.Linear(condition_dim, 64), nn.ELU(),
+            nn.Linear(64, output_dim), nn.Tanh(),
         )
         self.prior_bias_scale = nn.Parameter(torch.tensor(float(prior_bias_init)))
 
     def encode(self, x_true: torch.Tensor, condition: torch.Tensor):
+        """将 (x_true, condition) 编码为潜在分布 (mu, logvar)。"""
         h = self.encoder(torch.cat([x_true, condition], dim=-1))
         return self.fc_mu(h), self.fc_logvar(h)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """训练时重参数化采样 z = mu + sigma * epsilon，推理时直接返回 mu。"""
         if self.training:
             std = torch.exp(0.5 * logvar)
             return mu + std * torch.randn_like(std)
         return mu
 
     def decode(self, z: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        """解码：decoder(z, condition) + prior_bias(condition) * clamp(scale)。"""
         base = self.decoder(torch.cat([z, condition], dim=-1))
         bias_scale = torch.clamp(self.prior_bias_scale, min=0.0, max=self.prior_bias_max)
         bias = self.prior_bias(condition) * bias_scale
         return base + bias
 
     def forward(self, x_true, condition):
+        """训练前向传播：encode -> reparameterize -> decode，返回 (x_pred, mu, logvar)。"""
         mu, logvar = self.encode(x_true, condition)
         z = self.reparameterize(mu, logvar)
         x_pred = self.decode(z, condition)
         return x_pred, mu, logvar
 
     def sample(self, condition: torch.Tensor, n_samples: int = 1) -> torch.Tensor:
+        """从先验 N(0,I) 采样潜在向量并解码，返回 (B, n_samples, output_dim)。"""
         batch_size = condition.size(0)
         z = torch.randn(batch_size * n_samples, self.latent_dim, device=condition.device)
         cond_rep = condition.repeat_interleave(n_samples, dim=0)
         return self.decode(z, cond_rep).view(batch_size, n_samples, -1)
 
     def prior_mean(self, condition: torch.Tensor) -> torch.Tensor:
+        """将潜在向量设为零（先验均值），仅通过条件和偏置得到基线几何参数。"""
         z = torch.zeros(condition.size(0), self.latent_dim, device=condition.device)
         return self.decode(z, condition)
 
 
 def _resolve_policy_cfg(cfg: dict):
+    """解析配置字典，支持嵌套格式 {"gnn_policy":...} 和扁平格式，返回 (gnn_cfg, cvae_cfg, curve_cfg)。"""
     if "gnn_policy" in cfg:
         gnn_cfg = dict(cfg.get("gnn_policy", {}))
         cvae_cfg = dict(cfg.get("cvae", {}))
@@ -128,9 +144,12 @@ def _resolve_policy_cfg(cfg: dict):
 
 
 class GNNPolicy(nn.Module):
-    """Graph policy used by IL, RL and inference."""
+    """GNN 策略网络：整合 GNN 编码器、拓扑评分、动作预测 (u/v/w)、几何码预测和 CVAE 几何生成头。
+    支持 family/step_index/step_count 嵌入和动作码本的动态设置。
+    """
 
     def __init__(self, cfg: dict):
+        """初始化策略网络。cfg 支持嵌套和扁平两种格式。"""
         super().__init__()
         gnn_cfg, cvae_cfg, curve_cfg = _resolve_policy_cfg(cfg)
 
@@ -147,90 +166,64 @@ class GNNPolicy(nn.Module):
         self.num_geometry_codes = int(gnn_cfg.get("num_geometry_codes", 32))
         self.action_code_dim = int(gnn_cfg.get("action_code_dim", 6))
 
+        # GNN 编码器
         self.gnn = GNNEncoder(
-            dim_input_nodes=node_dim,
-            dim_input_edges=edge_dim,
-            n_layers=n_layers,
-            dim_hidden=hidden_dim,
-            dropout=dropout,
+            dim_input_nodes=node_dim, dim_input_edges=edge_dim,
+            n_layers=n_layers, dim_hidden=hidden_dim, dropout=dropout,
         )
 
-        self.topo_head = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.ELU(),
-            nn.Linear(64, 1),
-        )
+        # 拓扑评分头
+        self.topo_head = nn.Sequential(nn.Linear(hidden_dim, 64), nn.ELU(), nn.Linear(64, 1))
 
+        # CVAE 几何头
         latent_dim = cvae_cfg.get("latent_dim", 64)
         condition_dim = hidden_dim + self.curve_latent_dim
         self.geo_head = GeometryHead(
-            condition_dim=condition_dim,
-            latent_dim=latent_dim,
-            output_dim=4,
+            condition_dim=condition_dim, latent_dim=latent_dim, output_dim=4,
             prior_bias_init=cvae_cfg.get("prior_bias_init", 0.10),
             prior_bias_max=cvae_cfg.get("prior_bias_max", 0.50),
         )
 
+        # 嵌入层
         family_embedding_dim = int(gnn_cfg.get("family_embedding_dim", 8))
         step_embedding_dim = int(gnn_cfg.get("step_embedding_dim", 8))
         context_hidden_dim = int(gnn_cfg.get("context_hidden_dim", hidden_dim))
+
         self.family_embedding = nn.Embedding(self.num_families + 1, family_embedding_dim)
         self.step_index_embedding = nn.Embedding(self.max_step_count + 1, step_embedding_dim)
         self.step_count_embedding = nn.Embedding(self.max_step_count + 1, step_embedding_dim)
-        context_input_dim = (
-            hidden_dim
-            + self.curve_latent_dim
-            + family_embedding_dim
-            + step_embedding_dim
-            + step_embedding_dim
-        )
+
+        # 上下文 MLP: 融合图特征、曲线编码和各种嵌入
+        context_input_dim = hidden_dim + self.curve_latent_dim + family_embedding_dim + step_embedding_dim * 2
         self.context_mlp = nn.Sequential(
-            nn.Linear(context_input_dim, context_hidden_dim),
-            nn.ELU(),
-            nn.Linear(context_hidden_dim, context_hidden_dim),
-            nn.ELU(),
+            nn.Linear(context_input_dim, context_hidden_dim), nn.ELU(),
+            nn.Linear(context_hidden_dim, context_hidden_dim), nn.ELU(),
         )
+
+        # 动作预测头: 为每个节点预测被选为 u/v/w 的分数
         node_head_input_dim = hidden_dim + context_hidden_dim
-        self.action_u_head = nn.Sequential(
-            nn.Linear(node_head_input_dim, hidden_dim),
-            nn.ELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.action_v_head = nn.Sequential(
-            nn.Linear(node_head_input_dim, hidden_dim),
-            nn.ELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.action_w_head = nn.Sequential(
-            nn.Linear(node_head_input_dim, hidden_dim),
-            nn.ELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.stop_head = nn.Sequential(
-            nn.Linear(context_hidden_dim, hidden_dim),
-            nn.ELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.step_role_head = nn.Sequential(
-            nn.Linear(context_hidden_dim, hidden_dim),
-            nn.ELU(),
-            nn.Linear(hidden_dim, 2),
-        )
-        self.step_count_head = nn.Sequential(
-            nn.Linear(context_hidden_dim, hidden_dim),
-            nn.ELU(),
-            nn.Linear(hidden_dim, self.max_step_count),
-        )
+        self.action_u_head = nn.Sequential(nn.Linear(node_head_input_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, 1))
+        self.action_v_head = nn.Sequential(nn.Linear(node_head_input_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, 1))
+        self.action_w_head = nn.Sequential(nn.Linear(node_head_input_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, 1))
+
+        # 其他预测头
+        self.stop_head = nn.Sequential(nn.Linear(context_hidden_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, 1))
+        self.step_role_head = nn.Sequential(nn.Linear(context_hidden_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, 2))
+        self.step_count_head = nn.Sequential(nn.Linear(context_hidden_dim, hidden_dim), nn.ELU(), nn.Linear(hidden_dim, self.max_step_count))
+
+        # 几何码预测头: 上下文 + u/v/w 节点特征 -> 码本分布
         geometry_head_input_dim = context_hidden_dim + hidden_dim * 3
         self.geometry_code_head = nn.Sequential(
-            nn.Linear(geometry_head_input_dim, hidden_dim),
-            nn.ELU(),
+            nn.Linear(geometry_head_input_dim, hidden_dim), nn.ELU(),
             nn.Linear(hidden_dim, self.num_geometry_codes),
         )
+
+        # 动作码本缓冲区
         self.register_buffer("action_codebook", torch.zeros((self.num_geometry_codes, self.action_code_dim), dtype=torch.float32))
         self.action_codebook_buckets: dict[str, list[int]] = {}
 
     def encode_graph(self, data):
+        """用 GNN 编码图为节点特征。若无 edge_attr 则根据节点位置计算欧氏距离作为边特征。"""
         edge_attr = data.edge_attr
         if edge_attr is None:
             pos = data.pos if hasattr(data, "pos") and data.pos is not None else data.x[:, :2]
@@ -238,31 +231,28 @@ class GNNPolicy(nn.Module):
             edge_attr = torch.norm(pos[col] - pos[row], dim=-1, keepdim=True)
 
         x_enc, _ = self.gnn(
-            emb_nodes=data.x,
-            emb_edges=edge_attr,
-            edge_index=data.edge_index,
-            graph_node_index=getattr(data, "batch", None),
+            emb_nodes=data.x, emb_edges=edge_attr,
+            edge_index=data.edge_index, graph_node_index=getattr(data, "batch", None),
         )
         return x_enc
 
     def topology_scores(self, x_enc: torch.Tensor) -> torch.Tensor:
+        """计算节点拓扑重要性分数，形状 (N,)。"""
         return self.topo_head(x_enc)
 
     def _batch_index(self, data, x_enc: torch.Tensor) -> torch.Tensor:
+        """获取节点批次索引，单图模式下全为 0。"""
         batch_index = getattr(data, "batch", None)
         if batch_index is None:
             batch_index = torch.zeros(x_enc.size(0), dtype=torch.long, device=x_enc.device)
         return batch_index
 
     def build_il_context(
-        self,
-        data,
-        x_enc: torch.Tensor,
-        z_c: torch.Tensor | None,
-        family_ids: torch.Tensor | None = None,
-        step_indices: torch.Tensor | None = None,
+        self, data, x_enc: torch.Tensor, z_c: torch.Tensor | None,
+        family_ids: torch.Tensor | None = None, step_indices: torch.Tensor | None = None,
         step_counts: torch.Tensor | None = None,
     ):
+        """构建 IL 上下文：聚合节点特征为图级特征，融合曲线编码和嵌入，返回 (context, batch_index)。"""
         batch_index = self._batch_index(data, x_enc)
         graph_feat = scatter(x_enc, batch_index, dim=0, reduce="mean")
         num_graphs = graph_feat.size(0)
@@ -286,30 +276,25 @@ class GNNPolicy(nn.Module):
         family_emb = self.family_embedding(family_ids)
         step_index_emb = self.step_index_embedding(step_indices)
         step_count_emb = self.step_count_embedding(step_counts)
+
         context = self.context_mlp(
             torch.cat([graph_feat, z_c, family_emb, step_index_emb, step_count_emb], dim=-1)
         )
         return context, batch_index
 
     def phase4_outputs(
-        self,
-        data,
-        x_enc: torch.Tensor,
-        z_c: torch.Tensor | None,
-        family_ids: torch.Tensor | None = None,
-        step_indices: torch.Tensor | None = None,
+        self, data, x_enc: torch.Tensor, z_c: torch.Tensor | None,
+        family_ids: torch.Tensor | None = None, step_indices: torch.Tensor | None = None,
         step_counts: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
+        """Phase 4 主接口：一次性输出 u/v/w logits、stop/step_role/step_count logits 和 graph_context。"""
         context, batch_index = self.build_il_context(
-            data,
-            x_enc,
-            z_c,
-            family_ids=family_ids,
-            step_indices=step_indices,
-            step_counts=step_counts,
+            data, x_enc, z_c, family_ids=family_ids,
+            step_indices=step_indices, step_counts=step_counts,
         )
         node_context = context[batch_index]
         node_inputs = torch.cat([x_enc, node_context], dim=-1)
+
         return {
             "graph_context": context,
             "u_logits": self.action_u_head(node_inputs).squeeze(-1),
@@ -321,24 +306,25 @@ class GNNPolicy(nn.Module):
         }
 
     def resize_geometry_code_head(self, num_geometry_codes: int):
+        """动态调整几何码预测头输出维度和码本缓冲区大小。"""
         num_geometry_codes = max(1, int(num_geometry_codes))
         if num_geometry_codes == self.num_geometry_codes:
             return
+
         hidden_dim = self.hidden_dim
         input_dim = self.geometry_code_head[0].in_features
         self.geometry_code_head = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ELU(),
+            nn.Linear(input_dim, hidden_dim), nn.ELU(),
             nn.Linear(hidden_dim, num_geometry_codes),
         ).to(self.action_codebook.device)
         self.num_geometry_codes = num_geometry_codes
         self._buffers["action_codebook"] = torch.zeros(
             (num_geometry_codes, self.action_code_dim),
-            dtype=torch.float32,
-            device=self.action_codebook.device,
+            dtype=torch.float32, device=self.action_codebook.device,
         )
 
     def set_action_codebook(self, codebook: torch.Tensor, buckets: dict[str, list[int]] | None = None):
+        """设置动作码本及桶映射。自动调整几何码头输出维度以匹配码本大小。"""
         codebook = codebook.detach().float()
         if codebook.dim() != 2:
             raise ValueError(f"expected 2D codebook tensor, got {tuple(codebook.shape)}")
@@ -348,12 +334,9 @@ class GNNPolicy(nn.Module):
         self.action_codebook_buckets = {str(key): [int(idx) for idx in value] for key, value in (buckets or {}).items()}
 
     def geometry_code_logits(
-        self,
-        data,
-        x_enc: torch.Tensor,
-        graph_context: torch.Tensor,
-        action_topo: torch.Tensor,
+        self, data, x_enc: torch.Tensor, graph_context: torch.Tensor, action_topo: torch.Tensor,
     ) -> torch.Tensor:
+        """根据选定的 u/v/w 节点特征和图上下文，输出几何码 logits (B, num_geometry_codes)。"""
         batch_index = self._batch_index(data, x_enc)
         offsets = data.ptr[:-1].to(x_enc.device) if hasattr(data, "ptr") and data.ptr is not None else torch.tensor([0], dtype=torch.long, device=x_enc.device)
         global_action = action_topo.long().to(x_enc.device) + offsets.unsqueeze(1)
@@ -364,17 +347,11 @@ class GNNPolicy(nn.Module):
         return self.geometry_code_head(head_in)
 
     def predict_geometry_code(
-        self,
-        data,
-        x_enc: torch.Tensor,
-        graph_context: torch.Tensor,
-        action_topo: torch.Tensor,
-        *,
-        family_ids: torch.Tensor | None = None,
-        step_roles: torch.Tensor | None = None,
-        step_indices: torch.Tensor | None = None,
-        bucket_map: dict[str, list[int]] | None = None,
+        self, data, x_enc: torch.Tensor, graph_context: torch.Tensor, action_topo: torch.Tensor,
+        *, family_ids: torch.Tensor | None = None, step_roles: torch.Tensor | None = None,
+        step_indices: torch.Tensor | None = None, bucket_map: dict[str, list[int]] | None = None,
     ) -> torch.Tensor:
+        """带桶约束的几何码预测：根据 family/step_role 确定允许的码本桶，在桶内选最高分码。"""
         from src.inverse.action_codebook import family_name_from_index, resolve_codebook_bucket_for_step
 
         logits = self.geometry_code_logits(data, x_enc, graph_context, action_topo)
@@ -387,9 +364,7 @@ class GNNPolicy(nn.Module):
             family_name = family_name_from_index(int(family_ids[row_idx].item()))
             step_role = "semantic" if int(step_roles[row_idx].item()) == 1 else "aux"
             bucket = resolve_codebook_bucket_for_step(
-                allowed_map,
-                family_name,
-                step_role,
+                allowed_map, family_name, step_role,
                 step_index=int(step_indices[row_idx].item()) if step_indices is not None else None,
                 action_topo=action_topo[row_idx],
             )
@@ -401,19 +376,16 @@ class GNNPolicy(nn.Module):
         return torch.argmax(masked, dim=-1)
 
     def geometry_condition(
-        self,
-        x_enc: torch.Tensor,
-        u_idx: int,
-        v_idx: int,
-        w_idx: int,
-        z_c: torch.Tensor,
+        self, x_enc: torch.Tensor, u_idx: int, v_idx: int, w_idx: int, z_c: torch.Tensor,
     ) -> torch.Tensor:
+        """将 u/v/w 三节点特征取均值后与曲线条件 z_c 拼接，作为 CVAE 几何头的输入条件。"""
         feat_uvw = (x_enc[u_idx] + x_enc[v_idx] + x_enc[w_idx]) / 3.0
         feat_uvw = feat_uvw.unsqueeze(0)
         z_c_flat = z_c.view(1, -1)
         return torch.cat([feat_uvw, z_c_flat], dim=-1)
 
     def forward(self, data, z_c: torch.Tensor, true_coords=None, u_idx=None, v_idx=None, w_idx=None):
+        """前向传播：GNN 编码 -> 拓扑评分 -> (可选) CVAE 生成几何参数。返回 (topo_scores, geo_out)。"""
         x_enc = self.encode_graph(data)
         topo_scores = self.topology_scores(x_enc).squeeze(-1)
 

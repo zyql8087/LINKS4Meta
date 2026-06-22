@@ -1,3 +1,8 @@
+"""
+实验工具模块。
+提供数据集划分、目标特征构建、批量指标计算（Chamfer/NRMSE/平滑度）、奖励计算和难度评估。
+"""
+
 import json
 import math
 import os
@@ -10,16 +15,19 @@ import torch
 
 
 def _as_tensor(x, dtype=torch.float32) -> torch.Tensor:
+    """将输入转换为 PyTorch 张量。"""
     if isinstance(x, torch.Tensor):
         return x.detach().to(dtype=dtype)
     return torch.as_tensor(x, dtype=dtype)
 
 
 def subset_by_indices(items: Sequence, indices: Sequence[int]) -> List:
+    """根据索引列表提取子集。"""
     return [items[i] for i in indices]
 
 
 def _load_split_artifact(split_path: str) -> Dict[str, object]:
+    """加载数据集划分文件（JSON 或 .pt 格式）。"""
     path = Path(split_path)
     if path.suffix.lower() == '.json':
         with path.open('r', encoding='utf-8') as handle:
@@ -28,6 +36,7 @@ def _load_split_artifact(split_path: str) -> Dict[str, object]:
 
 
 def _canonical_split_indices(split: Dict[str, object]) -> Dict[str, List[int]]:
+    """将划分字典规范化为标准键名。"""
     return {
         'train_indices': [int(idx) for idx in split.get('train_indices', split.get('train', []))],
         'val_indices': [int(idx) for idx in split.get('val_indices', split.get('val', []))],
@@ -36,6 +45,7 @@ def _canonical_split_indices(split: Dict[str, object]) -> Dict[str, List[int]]:
 
 
 def _validate_split_indices(split: Dict[str, List[int]], num_samples: int) -> None:
+    """验证划分索引的合法性：无重复、无越界、无交叠、覆盖完整。"""
     seen: set[int] = set()
     for split_name in ('train_indices', 'val_indices', 'test_indices'):
         indices = split[split_name]
@@ -48,7 +58,6 @@ def _validate_split_indices(split: Dict[str, List[int]], num_samples: int) -> No
         if overlap:
             raise ValueError(f'Indices {sorted(overlap)} appear in multiple splits')
         seen.update(indices)
-
     if len(seen) != num_samples:
         missing = sorted(set(range(num_samples)) - seen)
         raise ValueError(f'Split does not cover all samples; missing indices={missing[:10]}')
@@ -61,6 +70,7 @@ def _normalize_precomputed_split(
     sample_ids: Optional[Sequence[int]],
     split_path: str,
 ) -> Dict[str, object]:
+    """规范化预计算划分：键名标准化、全局索引映射到局部、验证合法性。"""
     split = _canonical_split_indices(raw_split)
     missing_source_indices: List[int] = []
     if sample_ids is not None:
@@ -102,6 +112,10 @@ def load_or_create_fixed_split(
     precomputed_split_path: Optional[str] = None,
     sample_ids: Optional[Sequence[int]] = None,
 ) -> Dict[str, object]:
+    """
+    加载或创建固定的数据集划分。
+    优先级：预计算划分 > 缓存划分 > 新建随机划分。
+    """
     if precomputed_split_path and os.path.exists(precomputed_split_path):
         split = _normalize_precomputed_split(
             _load_split_artifact(precomputed_split_path),
@@ -163,6 +177,7 @@ def build_target_feature(
     sample: Dict[str, torch.Tensor],
     weights: Optional[Dict[str, float]] = None,
 ) -> torch.Tensor:
+    """将样本目标曲线加权拼接为一维特征向量（权重取平方根以匹配 MSE 损失）。"""
     weights = weights or {}
     w_foot = math.sqrt(float(weights.get('w_foot', 1.0)))
     w_knee = math.sqrt(float(weights.get('w_knee', 1.0)))
@@ -178,10 +193,12 @@ def stack_target_features(
     samples: Sequence[Dict[str, torch.Tensor]],
     weights: Optional[Dict[str, float]] = None,
 ) -> torch.Tensor:
+    """将多个样本的目标特征堆叠为批量张量。"""
     return torch.stack([build_target_feature(sample, weights=weights) for sample in samples], dim=0)
 
 
 def compute_sample_difficulty(sample: Dict[str, torch.Tensor]) -> float:
+    """计算样本难度分数（基于足部曲率、跨度和关节振幅）。"""
     y_foot = _as_tensor(sample['y_foot'])
     y_knee = _as_tensor(sample['y_knee'])
     y_ankle = _as_tensor(sample['y_ankle'])
@@ -204,6 +221,7 @@ def select_hard_test_indices(
     hard_fraction: float = 0.25,
     min_hard_samples: int = 128,
 ) -> List[int]:
+    """从测试集中按难度降序选取困难样本索引。"""
     test_indices = list(split['test_indices'])
     scored = [(compute_sample_difficulty(samples[idx]), idx) for idx in test_indices]
     scored.sort(key=lambda item: item[0], reverse=True)
@@ -214,6 +232,7 @@ def select_hard_test_indices(
 
 
 def _ensure_batch_target(target_tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """确保目标张量具有批次维度。"""
     if target_tensor.dim() == 2:
         return target_tensor.unsqueeze(0).expand(batch_size, -1, -1)
     if target_tensor.dim() == 1:
@@ -222,6 +241,7 @@ def _ensure_batch_target(target_tensor: torch.Tensor, batch_size: int) -> torch.
 
 
 def _normalized_rmse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """计算归一化 RMSE（RMSE / 目标值范围）。"""
     dims = tuple(range(1, pred.dim()))
     rmse = torch.sqrt(torch.mean((pred - target) ** 2, dim=dims))
     target_flat = target.reshape(target.size(0), -1)
@@ -231,11 +251,13 @@ def _normalized_rmse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 def _foot_scale(target_foot: torch.Tensor) -> torch.Tensor:
+    """计算足部目标轨迹的对角线长度（用于 Chamfer 归一化）。"""
     span = target_foot.max(dim=1).values - target_foot.min(dim=1).values
     return torch.clamp(torch.norm(span, dim=-1), min=1e-6)
 
 
 def chamfer_distance_foot_batch(pred_foot: torch.Tensor, target_foot: torch.Tensor) -> torch.Tensor:
+    """批量计算足部轨迹的 Chamfer 距离。"""
     dist = torch.cdist(pred_foot.float(), target_foot.float())
     d1 = dist.min(dim=2).values.mean(dim=1)
     d2 = dist.min(dim=1).values.mean(dim=1)
@@ -247,6 +269,7 @@ def smoothness_penalty_batch(
     pred_knee: torch.Tensor,
     pred_ankle: torch.Tensor,
 ) -> torch.Tensor:
+    """批量计算平滑度惩罚（二阶差分）。总惩罚 = foot + 0.5*knee + 0.5*ankle。"""
     if pred_foot.size(1) < 3:
         return torch.zeros(pred_foot.size(0), dtype=pred_foot.dtype, device=pred_foot.device)
 
@@ -266,6 +289,10 @@ def compute_joint_metrics_batch(
     target: Dict[str, torch.Tensor],
     metric_cfg: Optional[Dict[str, float]] = None,
 ) -> Dict[str, torch.Tensor]:
+    """
+    批量计算联合评估指标。
+    包含 foot_chamfer、foot_nrmse、knee_nrmse、ankle_nrmse、foot_score、smoothness、joint_score。
+    """
     metric_cfg = metric_cfg or {}
     batch_size = pred_foot.size(0)
     target_foot = _ensure_batch_target(_as_tensor(target['y_foot'], dtype=pred_foot.dtype), batch_size).to(pred_foot.device)
@@ -307,6 +334,10 @@ def compute_reward_batch(
     target: Dict[str, torch.Tensor],
     reward_cfg: Optional[Dict[str, float]] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    批量计算奖励值。
+    奖励 = -(joint_score + w_smooth * smoothness)。
+    """
     reward_cfg = reward_cfg or {}
     metrics = compute_joint_metrics_batch(pred_foot, pred_knee, pred_ankle, target, metric_cfg=reward_cfg)
     w_smooth = float(reward_cfg.get('w_smooth', 0.05))
@@ -316,6 +347,7 @@ def compute_reward_batch(
 
 
 def metrics_to_numpy(metrics: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
+    """将指标字典中的张量转为 NumPy 数组。"""
     out = {}
     for key, value in metrics.items():
         if isinstance(value, torch.Tensor):
@@ -326,10 +358,11 @@ def metrics_to_numpy(metrics: Dict[str, torch.Tensor]) -> Dict[str, np.ndarray]:
 
 
 def summarize_metric_dicts(metric_dicts: Iterable[Dict[str, float]]) -> Dict[str, float]:
+    """对多个指标字典求均值汇总。"""
     metric_dicts = list(metric_dicts)
     if not metric_dicts:
         return {}
-    keys = sorted(metric_dicts[0].keys())
+    keys = sorted(metric_dicts[0])
     return {
         key: float(np.mean([metrics[key] for metrics in metric_dicts]))
         for key in keys

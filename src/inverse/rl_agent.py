@@ -1,3 +1,9 @@
+"""
+PPO 强化学习智能体模块。
+实现基于 PPO 算法的图构建智能体，包含策略评估、动作选择和 PPO 更新。
+动作空间由拓扑 (u,v,w) 节点三元组、几何 codebook 编码和可选停止动作组成。
+"""
+
 from __future__ import annotations
 
 from collections import Counter
@@ -19,16 +25,14 @@ from src.inverse.action_codebook import (
 
 
 class GraphCritic(nn.Module):
+    """图级价值函数网络：GNN 编码 + z_c 拼接 -> MLP -> 标量 V(s)。"""
+
     def __init__(self, hidden_dim: int = 128, latent_dim: int = 128):
         super().__init__()
         from src.layers_encoder import GNNEncoder
-
         self.gnn = GNNEncoder(
-            dim_input_nodes=4,
-            dim_input_edges=1,
-            n_layers=3,
-            dim_hidden=hidden_dim,
-            dropout=0.1,
+            dim_input_nodes=4, dim_input_edges=1,
+            n_layers=3, dim_hidden=hidden_dim, dropout=0.1,
         )
         self.value_head = nn.Sequential(
             nn.Linear(hidden_dim + latent_dim, 128),
@@ -39,6 +43,7 @@ class GraphCritic(nn.Module):
         )
 
     def forward(self, data: Data, z_c: torch.Tensor) -> torch.Tensor:
+        """前向传播，返回形状 (batch_size,) 的价值估计。"""
         edge_attr = data.edge_attr
         if edge_attr is None:
             pos = data.pos if data.pos is not None else data.x[:, :2]
@@ -46,16 +51,16 @@ class GraphCritic(nn.Module):
             edge_attr = torch.norm(pos[col] - pos[row], dim=-1, keepdim=True)
 
         x_enc, _ = self.gnn(
-            emb_nodes=data.x,
-            emb_edges=edge_attr,
-            edge_index=data.edge_index,
-            graph_node_index=data.batch,
+            emb_nodes=data.x, emb_edges=edge_attr,
+            edge_index=data.edge_index, graph_node_index=data.batch,
         )
         graph_feat = scatter(x_enc, data.batch, dim=0, reduce='mean')
         return self.value_head(torch.cat([graph_feat, z_c], dim=-1)).squeeze(-1)
 
 
 class PPOBuffer:
+    """PPO 经验回放缓冲区，存储轨迹数据并提供 GAE 优势函数计算。"""
+
     def __init__(self):
         self.states: List[Data] = []
         self.z_cs: List[torch.Tensor] = []
@@ -66,6 +71,7 @@ class PPOBuffer:
         self.dones: List[bool] = []
 
     def store(self, state, z_c, action, reward, log_prob, value, done):
+        """存储一步轨迹数据。"""
         self.states.append(state)
         self.z_cs.append(z_c)
         self.actions.append(action)
@@ -78,6 +84,7 @@ class PPOBuffer:
         self.__init__()
 
     def compute_returns(self, gamma: float = 0.99, last_value: float = 0.0):
+        """计算标准化的折扣回报和优势函数。"""
         rewards = self.rewards + [last_value]
         returns = []
         running = last_value
@@ -92,6 +99,11 @@ class PPOBuffer:
 
 
 class PPOAgent:
+    """
+    PPO 强化学习智能体，负责策略评估、动作选择和 PPO 更新。
+    与 policy 网络配合实现拓扑+几何的两阶段动作空间。
+    """
+
     def __init__(self, policy, curve_encoder, cfg: dict, device):
         self.policy = policy
         self.curve_encoder = curve_encoder
@@ -127,6 +139,7 @@ class PPOAgent:
 
     @staticmethod
     def _sample_order_from_probabilities(probabilities: np.ndarray) -> List[int]:
+        """按概率分布无放回采样排列顺序。"""
         probs = np.asarray(probabilities, dtype=np.float64).reshape(-1)
         if probs.size == 0:
             return []
@@ -141,10 +154,11 @@ class PPOAgent:
         return list(np.random.choice(len(probs), size=len(probs), replace=False, p=probs))
 
     def _enumerate_topologies(self, graph: Data):
+        """枚举当前图所有合法的 (u, v, w) 拓扑动作（u < v）。"""
         x_np = graph.x.detach().cpu().numpy()
         is_fixed = x_np[:, 2]
-        moving = [idx for idx in range(len(is_fixed)) if is_fixed[idx] == 0]
-        fixed = [idx for idx in range(len(is_fixed)) if is_fixed[idx] == 1]
+        moving = [idx for idx, value in enumerate(is_fixed) if value == 0]
+        fixed = [idx for idx, value in enumerate(is_fixed) if value == 1]
         topologies = []
         for i, u in enumerate(moving):
             for v in moving[i + 1:]:
@@ -154,6 +168,7 @@ class PPOAgent:
 
     @staticmethod
     def _sorted_undirected_edges(edge_index: torch.Tensor):
+        """从有向边索引提取去重排序的无向边列表。"""
         edges = set()
         for u, v in edge_index.detach().cpu().numpy().T.tolist():
             if u == v:
@@ -164,6 +179,7 @@ class PPOAgent:
 
     @staticmethod
     def _orientation(a, b, c, eps: float):
+        """三点定向：0=共线, 1=逆时针, -1=顺时针。"""
         value = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
         if abs(value) <= eps:
             return 0
@@ -171,6 +187,7 @@ class PPOAgent:
 
     @staticmethod
     def _on_segment(a, b, c, eps: float):
+        """判断共线点 c 是否在线段 ab 上。"""
         return (
             min(a[0], b[0]) - eps <= c[0] <= max(a[0], b[0]) + eps
             and min(a[1], b[1]) - eps <= c[1] <= max(a[1], b[1]) + eps
@@ -178,11 +195,11 @@ class PPOAgent:
 
     @classmethod
     def _segments_intersect(cls, p1, p2, p3, p4, eps: float):
+        """判断两条线段是否相交。"""
         o1 = cls._orientation(p1, p2, p3, eps)
         o2 = cls._orientation(p1, p2, p4, eps)
         o3 = cls._orientation(p3, p4, p1, eps)
         o4 = cls._orientation(p3, p4, p2, eps)
-
         if o1 != o2 and o3 != o4:
             return True
         if o1 == 0 and cls._on_segment(p1, p2, p3, eps):
@@ -196,6 +213,10 @@ class PPOAgent:
         return False
 
     def _passes_geometry_prior(self, graph: Data, u: int, v: int, w: int, n1, n2):
+        """
+        候选几何动作的先验合法性检查（距离、边长、交叉）。
+        返回 (is_valid, reason)。
+        """
         pos = graph.pos.detach().cpu().numpy()
         min_link_length = float(self.constraint_cfg.get('min_link_length', 0.05))
         min_node_distance = float(self.constraint_cfg.get('min_node_distance', 0.01))
@@ -228,7 +249,7 @@ class PPOAgent:
         for seg_id, p_a, p_b in candidate_segments:
             seg_nodes = {node for node in seg_id if isinstance(node, int)}
             for e_u, e_v in existing_edges:
-                if len({e_u, e_v} & seg_nodes) > 0:
+                if {e_u, e_v} & seg_nodes:
                     continue
                 if self._segments_intersect(p_a, p_b, pos[e_u], pos[e_v], intersection_eps):
                     return False, 'prior_edge_intersection'
@@ -245,6 +266,7 @@ class PPOAgent:
 
     @staticmethod
     def _finalize_diagnostics(diag: Dict) -> Dict:
+        """将诊断信息中的 Counter 转换为普通 dict。"""
         out = dict(diag)
         for key, value in list(out.items()):
             if isinstance(value, Counter):
@@ -262,6 +284,7 @@ class PPOAgent:
         step_index: int,
         expected_j_steps: int,
     ) -> tuple[list[int], np.ndarray]:
+        """根据机构族和步角色计算带掩码的几何编码概率分布。"""
         family_name = family_name_from_index(family_index)
         step_role = step_role_for_index(step_index, expected_j_steps)
         bucket = resolve_codebook_bucket_for_step(
@@ -274,13 +297,12 @@ class PPOAgent:
         allowed_ids = list(self.policy.action_codebook_buckets.get(bucket, []))
         if not allowed_ids:
             allowed_ids = list(range(int(self.policy.action_codebook.size(0))))
+
         batch = Batch.from_data_list([graph]).to(self.device)
         if x_enc_local.size(0) != graph.x.size(0):
             x_enc_local = self.policy.encode_graph(batch)
         logits = self.policy.geometry_code_logits(
-            batch,
-            x_enc_local,
-            graph_context,
+            batch, x_enc_local, graph_context,
             action_topo.view(1, -1).to(self.device),
         )[0]
         allowed_logits = logits[torch.tensor(allowed_ids, dtype=torch.long, device=logits.device)]
@@ -289,6 +311,11 @@ class PPOAgent:
 
     def _select_valid_action(self, graph: Data, x_enc: torch.Tensor, probs_i: np.ndarray,
                              z_c_i: torch.Tensor, deterministic: bool, context: Optional[Dict] = None):
+        """
+        为单个图选择合法的拓扑+几何动作。
+        两阶段采样：先按节点概率乘积采样拓扑，再从 codebook 中采样几何编码。
+        通过先验检查和完整验证后返回第一个合法动作。
+        """
         from src.inverse.rl_env import apply_j_operator, validate_graph_structure
 
         topologies = self._enumerate_topologies(graph)
@@ -301,6 +328,7 @@ class PPOAgent:
             'structure_reasons': Counter(),
             'valid_action': False,
         }
+
         if not bool(getattr(self.policy, 'geometry_code_ready', True)):
             diagnostics['failure_reason'] = 'geometry_code_unavailable'
             diagnostics['geometry_code_issue'] = str(
@@ -314,6 +342,7 @@ class PPOAgent:
             diagnostics['failure_reason'] = 'no_topology'
             return None, 0.0, self._finalize_diagnostics(diagnostics)
 
+        # 拓扑概率 P(u,v,w) = P(u) * P(v) * P(w)
         topo_scores = np.array([probs_i[u] * probs_i[v] * probs_i[w] for (u, v, w) in topologies], dtype=np.float64)
         topo_scores = np.maximum(topo_scores, 1e-12)
         topo_probs = topo_scores / topo_scores.sum()
@@ -327,9 +356,7 @@ class PPOAgent:
         step_index = int((context or {}).get('step_index', 0))
         expected_j_steps = int((context or {}).get('expected_j_steps', 1))
         graph_context = self.policy.build_il_context(
-            Batch.from_data_list([graph]).to(self.device),
-            x_enc,
-            z_c_i,
+            Batch.from_data_list([graph]).to(self.device), x_enc, z_c_i,
             family_ids=torch.tensor([family_index], dtype=torch.long, device=self.device),
             step_indices=torch.tensor([step_index], dtype=torch.long, device=self.device),
             step_counts=torch.tensor([expected_j_steps], dtype=torch.long, device=self.device),
@@ -339,13 +366,8 @@ class PPOAgent:
             u, v, w = topologies[topo_idx]
             action_topo = torch.tensor([u, v, w], dtype=torch.long, device=self.device)
             allowed_code_ids, code_probs = self._masked_code_distribution(
-                graph,
-                x_enc,
-                graph_context,
-                action_topo,
-                family_index=family_index,
-                step_index=step_index,
-                expected_j_steps=expected_j_steps,
+                graph, x_enc, graph_context, action_topo,
+                family_index=family_index, step_index=step_index, expected_j_steps=expected_j_steps,
             )
             if deterministic:
                 code_order = list(np.argsort(code_probs)[::-1])
@@ -384,12 +406,8 @@ class PPOAgent:
                 diagnostics['chosen_topology'] = (u, v, w)
                 diagnostics['chosen_code_id'] = code_id
                 return {
-                    'u': u,
-                    'v': v,
-                    'w': w,
-                    'code_id': code_id,
-                    'n1': n1,
-                    'n2': n2,
+                    'u': u, 'v': v, 'w': w, 'code_id': code_id,
+                    'n1': n1, 'n2': n2,
                     'family_index': family_index,
                     'step_index': step_index,
                     'expected_j_steps': expected_j_steps,
@@ -399,6 +417,7 @@ class PPOAgent:
         return None, 0.0, self._finalize_diagnostics(diagnostics)
 
     def _topology_distribution(self, graph: Data, probs_i: np.ndarray):
+        """计算所有拓扑动作的概率分布。P(u,v,w) = P(u)*P(v)*P(w)，归一化。"""
         topologies = self._enumerate_topologies(graph)
         if not topologies:
             return [], np.empty(0, dtype=np.float64)
@@ -416,6 +435,10 @@ class PPOAgent:
         context: Optional[Dict] = None,
         top_k: Optional[int] = None,
     ) -> List[Dict]:
+        """
+        对候选动作排序（用于推理/评估），返回 top-k 候选。
+        每个候选包含 action、graph、log_prob、policy_score 等。
+        """
         batch = Batch.from_data_list([graph]).to(self.device)
         x_enc = self.policy.encode_graph(batch)
         from torch_geometric.utils import softmax as pyg_softmax
@@ -427,35 +450,30 @@ class PPOAgent:
 
         stop_prob = 0.0
         allow_stop = False
+        phase4_outputs = None
         if context is not None:
             family_ids = torch.tensor(
                 [int(context.get('family_index', self.policy.num_families))],
-                dtype=torch.long,
-                device=self.device,
+                dtype=torch.long, device=self.device,
             )
             step_indices = torch.tensor(
                 [int(context.get('step_index', 0))],
-                dtype=torch.long,
-                device=self.device,
+                dtype=torch.long, device=self.device,
             )
             step_counts = torch.tensor(
                 [int(context.get('expected_j_steps', 1))],
-                dtype=torch.long,
-                device=self.device,
+                dtype=torch.long, device=self.device,
             )
             phase4_outputs = self.policy.phase4_outputs(
-                batch,
-                x_enc,
-                z_c_i,
-                family_ids=family_ids,
-                step_indices=step_indices,
-                step_counts=step_counts,
+                batch, x_enc, z_c_i,
+                family_ids=family_ids, step_indices=step_indices, step_counts=step_counts,
             )
             stop_prob = float(torch.sigmoid(phase4_outputs['stop_logits'][0]).item())
             allow_stop = bool(context.get('can_stop', False))
 
         topologies, topo_probs = self._topology_distribution(graph, probs_i)
         candidates = []
+
         if allow_stop:
             candidates.append(
                 {
@@ -467,7 +485,7 @@ class PPOAgent:
                 }
             )
 
-        topo_order = list(np.argsort(topo_probs)[::-1]) if len(topo_probs) > 0 else []
+        topo_order = list(np.argsort(topo_probs)[::-1]) if topo_probs.size else []
         keep_count = max(int(top_k or 1), 1)
         for topo_idx in topo_order:
             if len([item for item in candidates if not item['stop']]) >= keep_count:
@@ -475,9 +493,8 @@ class PPOAgent:
             u, v, w = topologies[topo_idx]
             action_topo = torch.tensor([u, v, w], dtype=torch.long, device=self.device)
             allowed_code_ids, code_probs = self._masked_code_distribution(
-                graph,
-                x_enc[: graph.x.size(0)],
-                phase4_outputs['graph_context'],
+                graph, x_enc[: graph.x.size(0)],
+                phase4_outputs['graph_context'] if phase4_outputs is not None else torch.zeros(1, self.policy.hidden_dim, device=self.device),
                 action_topo,
                 family_index=int(context.get('family_index', self.policy.num_families)) if context is not None else self.policy.num_families,
                 step_index=int(context.get('step_index', 0)) if context is not None else 0,
@@ -505,7 +522,6 @@ class PPOAgent:
                     continue
                 try:
                     from src.inverse.rl_env import apply_j_operator, validate_graph_structure
-
                     candidate_graph = apply_j_operator(graph, u, v, w, n1, n2)
                     is_valid, _ = validate_graph_structure(candidate_graph, self.constraint_cfg)
                     if not is_valid:
@@ -516,12 +532,8 @@ class PPOAgent:
                     continue
                 chosen_code_prob = float(code_probs[code_local_idx])
                 action = {
-                    'u': int(u),
-                    'v': int(v),
-                    'w': int(w),
-                    'code_id': code_id,
-                    'n1': n1,
-                    'n2': n2,
+                    'u': int(u), 'v': int(v), 'w': int(w),
+                    'code_id': code_id, 'n1': n1, 'n2': n2,
                     'family_index': int(context.get('family_index', self.policy.num_families)) if context is not None else self.policy.num_families,
                     'step_index': int(context.get('step_index', 0)) if context is not None else 0,
                     'expected_j_steps': int(context.get('expected_j_steps', 1)) if context is not None else 1,
@@ -552,6 +564,10 @@ class PPOAgent:
                              return_diagnostics: bool = False,
                              contexts: Optional[List[Dict]] = None,
                              ) -> Tuple[List[Optional[Dict]], List[float], List[float]]:
+        """
+        批量选择动作（用于 rollout）。共享一次 GNN 前向传播。
+        返回 (actions, log_probs, values[, diagnostics])。
+        """
         if not graphs:
             return [], [], []
 
@@ -571,26 +587,19 @@ class PPOAgent:
         if contexts is not None:
             family_ids = torch.tensor(
                 [int(ctx.get('family_index', self.policy.num_families)) for ctx in contexts],
-                dtype=torch.long,
-                device=self.device,
+                dtype=torch.long, device=self.device,
             )
             step_indices = torch.tensor(
                 [int(ctx.get('step_index', 0)) for ctx in contexts],
-                dtype=torch.long,
-                device=self.device,
+                dtype=torch.long, device=self.device,
             )
             step_counts = torch.tensor(
                 [int(ctx.get('expected_j_steps', 1)) for ctx in contexts],
-                dtype=torch.long,
-                device=self.device,
+                dtype=torch.long, device=self.device,
             )
             phase4_outputs = self.policy.phase4_outputs(
-                batch,
-                x_enc,
-                z_cs_dev.view(len(graphs), -1),
-                family_ids=family_ids,
-                step_indices=step_indices,
-                step_counts=step_counts,
+                batch, x_enc, z_cs_dev.view(len(graphs), -1),
+                family_ids=family_ids, step_indices=step_indices, step_counts=step_counts,
             )
             stop_probs = torch.sigmoid(phase4_outputs['stop_logits']).detach().cpu().numpy().astype(np.float64)
 
@@ -605,6 +614,7 @@ class PPOAgent:
             stop_prob = float(stop_probs[i]) if stop_probs is not None else 0.0
             allow_stop = bool(contexts is not None and contexts[i].get('can_stop', False))
             stop_threshold = float(contexts[i].get('stop_threshold', 0.5)) if contexts is not None else 0.5
+
             if allow_stop:
                 stop_selected = bool(stop_prob >= stop_threshold) if deterministic else bool(np.random.rand() < stop_prob)
                 if stop_selected:
@@ -612,24 +622,17 @@ class PPOAgent:
                     log_probs.append(float(np.log(stop_prob + 1e-9)))
                     diagnostics.append(
                         {
-                            'valid_action': True,
-                            'stop_selected': True,
-                            'stop_probability': stop_prob,
-                            'num_topologies': 0,
-                            'sampled_geometries': 0,
-                            'geometry_prior_rejects': 0,
-                            'structure_rejects': 0,
-                            'geometry_prior_reasons': {},
+                            'valid_action': True, 'stop_selected': True,
+                            'stop_probability': stop_prob, 'num_topologies': 0,
+                            'sampled_geometries': 0, 'geometry_prior_rejects': 0,
+                            'structure_rejects': 0, 'geometry_prior_reasons': {},
                             'structure_reasons': {},
                         }
                     )
                     continue
 
             action, lp, diag = self._select_valid_action(
-                graph,
-                x_enc[start:end],
-                probs_i,
-                z_c_i,
+                graph, x_enc[start:end], probs_i, z_c_i,
                 deterministic=deterministic,
                 context=contexts[i] if contexts is not None else None,
             )
@@ -651,6 +654,7 @@ class PPOAgent:
 
     @torch.no_grad()
     def select_action(self, obs: dict, action: Optional[Dict] = None) -> tuple:
+        """单步动作选择与评估。action=None 时仅计算价值。返回 (action, log_prob, value)。"""
         graph = obs['graph']
         z_c = obs['z_c'].to(self.device) if obs['z_c'] is not None else torch.zeros(1, self.policy.curve_latent_dim, device=self.device)
         if action is None:
@@ -662,6 +666,7 @@ class PPOAgent:
 
     @torch.no_grad()
     def _evaluate_single_action(self, obs: dict, action: Dict) -> tuple:
+        """评估单个动作在当前策略下的对数概率和状态价值。"""
         graph = obs['graph']
         z_c = obs['z_c'].to(self.device) if obs['z_c'] is not None else torch.zeros(1, self.policy.curve_latent_dim, device=self.device)
         batch = Batch.from_data_list([graph]).to(self.device)
@@ -674,18 +679,13 @@ class PPOAgent:
             topo_idx = topologies.index((action['u'], action['v'], action['w']))
             action_topo = torch.tensor([[action['u'], action['v'], action['w']]], dtype=torch.long, device=self.device)
             context, _ = self.policy.build_il_context(
-                batch,
-                x_enc,
-                z_c.view(1, -1),
+                batch, x_enc, z_c.view(1, -1),
                 family_ids=torch.tensor([int(action.get('family_index', obs.get('family_index', self.policy.num_families)))], dtype=torch.long, device=self.device),
                 step_indices=torch.tensor([int(action.get('step_index', obs.get('step', 0)))], dtype=torch.long, device=self.device),
                 step_counts=torch.tensor([int(action.get('expected_j_steps', obs.get('expected_j_steps', 1)))], dtype=torch.long, device=self.device),
             )
             allowed_code_ids, code_probs = self._masked_code_distribution(
-                graph,
-                x_enc,
-                context,
-                action_topo.view(-1),
+                graph, x_enc, context, action_topo.view(-1),
                 family_index=int(action.get('family_index', obs.get('family_index', self.policy.num_families))),
                 step_index=int(action.get('step_index', obs.get('step', 0))),
                 expected_j_steps=int(action.get('expected_j_steps', obs.get('expected_j_steps', 1))),
@@ -700,6 +700,10 @@ class PPOAgent:
         return log_prob, value
 
     def update(self, buffer: PPOBuffer, n_epochs: int = 4):
+        """
+        执行 PPO 策略更新。
+        从 buffer 中提取有效（非停止）动作的轨迹，执行 n_epochs 轮更新。
+        """
         valid_idx = [
             idx for idx, action in enumerate(buffer.actions)
             if action is not None and not bool(action.get('stop', False))
@@ -735,6 +739,7 @@ class PPOAgent:
             topo_scores = self.policy.topology_scores(x_enc).squeeze(-1)
             probs = pyg_softmax(topo_scores, batch.batch)
 
+            # 重新计算每个动作在当前策略下的对数概率
             new_lp_values = []
             for local_idx, state in enumerate(states):
                 start = int(ptr[local_idx].item())
@@ -747,14 +752,10 @@ class PPOAgent:
                     state_batch = Batch.from_data_list([state]).to(self.device)
                     local_x_enc = x_enc[start:end]
                     context, _ = self.policy.build_il_context(
-                        state_batch,
-                        local_x_enc,
-                        z_cs[local_idx : local_idx + 1],
+                        state_batch, local_x_enc, z_cs[local_idx : local_idx + 1],
                     )
                     allowed_code_ids, code_probs = self._masked_code_distribution(
-                        state,
-                        local_x_enc,
-                        context,
+                        state, local_x_enc, context,
                         torch.tensor(action_tuple, dtype=torch.long, device=self.device),
                         family_index=int(family_s[local_idx].item()),
                         step_index=int(step_s[local_idx].item()),
@@ -768,14 +769,17 @@ class PPOAgent:
                 except ValueError:
                     new_lp_values.append(np.log(1e-9))
             new_lp = torch.tensor(new_lp_values, dtype=torch.float32, device=self.device)
-            ratio = torch.exp(new_lp - old_log_probs)
 
+            # PPO clipped surrogate objective
+            ratio = torch.exp(new_lp - old_log_probs)
             actor_loss = -torch.min(
                 ratio * adv_t,
                 torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_t,
             ).mean()
+
             value_pred = self.critic(batch, z_cs)
             critic_loss = nn.functional.mse_loss(value_pred, returns)
+
             entropy = (-(probs * torch.log(probs + 1e-9))).mean()
 
             loss = actor_loss + 0.5 * critic_loss - self.entropy_c * entropy

@@ -1,3 +1,8 @@
+"""
+Phase5 RL 数据准备与课程学习模块。
+将 Phase4 IL 轨迹重组为 RL 可用数据集，支持按机构族过滤和课程学习排序。
+"""
+
 from __future__ import annotations
 
 import copy
@@ -8,7 +13,10 @@ from typing import Iterable, Sequence
 from src.inverse.phase4_il import family_name_to_index, group_paths_by_trace
 from src.inverse.rl_env import apply_j_operator
 
+# 课程学习顺序：6bar -> 7bar -> 8bar -> 9bar（难度递增）
 FAMILY_STAGE_ORDER = ("6bar", "7bar", "8bar", "9bar")
+
+# 每族期望的 J-Operator 步数
 FAMILY_EXPECTED_J_STEPS = {
     "6bar": 1,
     "7bar": 1,
@@ -18,10 +26,12 @@ FAMILY_EXPECTED_J_STEPS = {
 
 
 def expected_j_steps_for_family(family_name: str, default: int = 1) -> int:
+    """获取指定机构族期望的 J-Operator 步数。"""
     return int(FAMILY_EXPECTED_J_STEPS.get(str(family_name), default))
 
 
 def build_trace_dataset(step_paths: Sequence[dict[str, object]]) -> list[dict[str, object]]:
+    """将 Phase4 的逐步路径数据重组为按 trace 分组的 RL 训练数据集。"""
     trace_dataset = []
     for trace_items in group_paths_by_trace(step_paths):
         first = trace_items[0]
@@ -47,29 +57,33 @@ def build_trace_dataset(step_paths: Sequence[dict[str, object]]) -> list[dict[st
 
 
 def reconstruct_expert_final_graph(trace_record: dict[str, object]):
+    """逐步应用 J-Operator 重建专家轨迹的最终图结构。"""
     graph = copy.deepcopy(trace_record["base_data"])
     for step in trace_record["step_paths"]:
         graph = apply_j_operator(
             graph,
-            int(step["action_topo"][0].item()),
-            int(step["action_topo"][1].item()),
-            int(step["action_topo"][2].item()),
-            step["action_geo"][:2].detach().cpu().numpy(),
-            step["action_geo"][2:].detach().cpu().numpy(),
+            int(step["action_topo"][0].item()),  # u
+            int(step["action_topo"][1].item()),  # v
+            int(step["action_topo"][2].item()),  # w
+            step["action_geo"][:2].detach().cpu().numpy(),   # n1 位置
+            step["action_geo"][2:].detach().cpu().numpy(),   # n2 位置
         )
     return graph
 
 
 def filter_trace_dataset(trace_dataset: Sequence[dict[str, object]], families: Iterable[str]) -> list[dict[str, object]]:
+    """按机构族名称过滤 trace 数据集，只保留指定族的记录。"""
     family_set = {str(name) for name in families}
     return [record for record in trace_dataset if str(record["family_id"]) in family_set]
 
 
 def build_family_curriculum(rl_cfg: dict) -> list[dict[str, object]]:
+    """根据配置构建课程学习阶段列表，按机构族难度递增排序。"""
     configured = rl_cfg.get("family_curriculum")
     episodes_default = int(rl_cfg.get("episodes_per_family", rl_cfg.get("episodes", 500)))
     update_epochs_default = int(rl_cfg.get("ppo_epochs", 4))
     rollout_batch_default = int(rl_cfg.get("rollout_batch_size", 8))
+
     if configured:
         curriculum = []
         for stage in configured:
@@ -95,6 +109,7 @@ def build_family_curriculum(rl_cfg: dict) -> list[dict[str, object]]:
 
 
 def sample_trace_batch(trace_dataset: Sequence[dict[str, object]], batch_size: int, rng: random.Random) -> list[dict[str, object]]:
+    """从 trace 数据集中随机采样一个批次。数据不足时有放回采样。"""
     if not trace_dataset:
         return []
     if len(trace_dataset) >= batch_size:
@@ -103,6 +118,7 @@ def sample_trace_batch(trace_dataset: Sequence[dict[str, object]], batch_size: i
 
 
 def summarize_family_trace_counts(trace_dataset: Sequence[dict[str, object]]) -> dict[str, int]:
+    """统计 trace 数据集中每个机构族的记录数量。"""
     counts = defaultdict(int)
     for record in trace_dataset:
         counts[str(record["family_id"])] += 1

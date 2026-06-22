@@ -1,11 +1,10 @@
-from __future__ import annotations
+"""
+RL MDP 环境模块。
+将自回归图构建过程建模为马尔可夫决策过程，以冻结的前向代理模型为奖励计算器。
+支持延迟 reward 模式：step() 只做图操作，episode 结束后批量计算 reward。
+"""
 
-# src/inverse/rl_env.py
-# RL MDP 环境：以冻结的前向代理模型为评估器，实现自回归图构建的 MDP
-#
-# State  : 当前机构图 (PyG Data) + 目标曲线条件向量 z_c + Residual 差值
-# Action : J-Operator 动作 (u,v,w) 选择 + C-VAE 几何坐标 (n1, n2)
-# Reward : R_sim (Chamfer + MSE) + R_physics (残差惩罚) + R_valid (卡死惩罚)
+from __future__ import annotations
 
 import copy
 import numpy as np
@@ -21,14 +20,14 @@ from src.inverse.readout_assignment import (
     assignment_to_masks,
 )
 
-
 _DEFAULT_READOUT_ASSIGNER = RuleBasedReadoutAssignment(top_k=3)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 前向代理模型加载（冻结）
+# 前向代理模型加载
 # ──────────────────────────────────────────────────────────────────────────────
 def _extract_model_state_dict(checkpoint) -> dict:
+    """从 checkpoint 中提取模型状态字典，支持标准格式和直接 state_dict 格式。"""
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         return checkpoint["model_state_dict"]
     if isinstance(checkpoint, dict):
@@ -37,6 +36,7 @@ def _extract_model_state_dict(checkpoint) -> dict:
 
 
 def inspect_forward_checkpoint_compatibility(checkpoint_state: dict, cfg: dict) -> dict:
+    """检查前向模型 checkpoint 与当前配置的兼容性，检测维度不匹配问题。"""
     encoder_cfg = dict(cfg.get("encoder", {}))
     decoder_cfg = dict(cfg.get("decoder", {}))
 
@@ -62,7 +62,7 @@ def inspect_forward_checkpoint_compatibility(checkpoint_state: dict, cfg: dict) 
     )
     has_family_embedding = "family_embedding.weight" in checkpoint_state
     has_step_context_encoder = any(
-        str(key).startswith("step_context_encoder.") for key in checkpoint_state.keys()
+        str(key).startswith("step_context_encoder.") for key in checkpoint_state
     )
 
     issues = []
@@ -103,7 +103,7 @@ def inspect_forward_checkpoint_compatibility(checkpoint_state: dict, cfg: dict) 
 
 
 def load_frozen_surrogate(model_path: str, config_path: str, device):
-    """加载并冻结前向 BioKinematicsGNN 作为 Reward 计算器"""
+    """加载并冻结前向 BioKinematicsGNN 作为 Reward 计算器。"""
     from src.generative_curve.GNN_model_biokinematics import BioKinematicsGNN
     with open(config_path, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
@@ -118,7 +118,7 @@ def load_frozen_surrogate(model_path: str, config_path: str, device):
             f"variant={compatibility['checkpoint_variant']}, "
             f"issues={issue_text}. "
             f"Use a checkpoint exported with the current 8-dim semantic/context forward config "
-            f"or retrain the forward model for '{config_path}'."
+            f"or retrain the forward model for '{model_path}'."
         )
     try:
         model.load_state_dict(state_dict)
@@ -135,15 +135,17 @@ def load_frozen_surrogate(model_path: str, config_path: str, device):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Reward 计算
+# 工具函数
 # ──────────────────────────────────────────────────────────────────────────────
 def _to_numpy(x):
+    """将张量或数组统一转换为 numpy 数组。"""
     if isinstance(x, torch.Tensor):
         return x.detach().cpu().numpy()
     return np.asarray(x)
 
 
 def _flag_is_true(value) -> bool:
+    """判断各种类型的标志值是否为 True（兼容 bool/int/float/Tensor/None）。"""
     if value is None:
         return False
     if isinstance(value, bool):
@@ -156,6 +158,7 @@ def _flag_is_true(value) -> bool:
 
 
 def _build_phase3_step_context(step_index: int, expected_j_steps: int) -> torch.Tensor:
+    """构建步上下文向量 (step_index, aux_steps, semantic_steps)。"""
     semantic_steps = 1 if int(step_index) >= int(expected_j_steps) else 0
     aux_steps = max(0, int(step_index) - semantic_steps)
     return torch.tensor(
@@ -173,6 +176,7 @@ def _build_surrogate_readout_assigner(
     step_index: int,
     expected_j_steps: int,
 ):
+    """构建基于 surrogate 模型的 readout 分配器。"""
     if surrogate is None:
         return None
     return SurrogateTargetReadoutAssignment(
@@ -187,6 +191,9 @@ def _build_surrogate_readout_assigner(
     )
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 语义掩码推断
+# ──────────────────────────────────────────────────────────────────────────────
 def _infer_semantic_masks(
     graph_data: Data,
     *,
@@ -195,9 +202,14 @@ def _infer_semantic_masks(
     allow_assignment_fallback: bool = True,
     readout_assigner=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    推断图中各节点的语义掩码（hip/knee/ankle/foot）。
+    优先级：缓存掩码 > 8维语义特征 > keypoints属性 > knee_idx > readout_assigner回退。
+    """
     num_nodes = int(graph_data.x.size(0))
     device = graph_data.x.device
     semantic_dirty = _flag_is_true(getattr(graph_data, "semantic_dirty", None))
+
     mask_hip = torch.zeros(num_nodes, dtype=torch.bool, device=device)
     mask_knee = torch.zeros(num_nodes, dtype=torch.bool, device=device)
     mask_ankle = torch.zeros(num_nodes, dtype=torch.bool, device=device)
@@ -222,6 +234,7 @@ def _infer_semantic_masks(
             if mask_knee.any() and mask_ankle.any() and mask_foot.any():
                 return mask_hip, mask_knee, mask_ankle, mask_foot
 
+        # 从8维节点特征的末4维语义 one-hot 提取
         if _flag_is_true(getattr(graph_data, "semantic_feature_layout", None)) and graph_data.x.size(-1) >= 8:
             semantic = graph_data.x[:, -4:]
             return (
@@ -250,6 +263,7 @@ def _infer_semantic_masks(
             if 0 <= knee_idx < num_nodes:
                 mask_knee[knee_idx] = True
 
+    # 回退：使用 readout_assigner 进行规则分配
     if allow_assignment_fallback and (not mask_knee.any() or not mask_ankle.any() or not mask_foot.any()):
         assigner = readout_assigner or _DEFAULT_READOUT_ASSIGNER
         assignment = assigner.assign(graph_data, target=target, motion=motion)
@@ -277,10 +291,12 @@ def _prepare_graph_for_surrogate(
     motion=None,
     readout_assigner=None,
 ) -> Data:
+    """为 surrogate 模型准备输入图数据：拼接语义掩码到节点特征，附加 family_id 和 step_context。"""
     prepared = copy.deepcopy(graph_data)
     x = prepared.x.float()
     if x.size(-1) < 4:
         raise ValueError(f"Expected at least 4 node features, got {x.size(-1)}")
+
     mask_hip, mask_knee, mask_ankle, mask_foot = _infer_semantic_masks(
         prepared,
         target=target,
@@ -288,18 +304,13 @@ def _prepare_graph_for_surrogate(
         readout_assigner=readout_assigner,
     )
     semantic = torch.stack(
-        [
-            mask_hip.float(),
-            mask_knee.float(),
-            mask_ankle.float(),
-            mask_foot.float(),
-        ],
+        [mask_hip.float(), mask_knee.float(), mask_ankle.float(), mask_foot.float()],
         dim=-1,
     )
     x_aug = torch.cat([x[:, :4], semantic], dim=-1)
+
     prepared.semantic_feature_layout = torch.tensor([1], dtype=torch.long)
     prepared.semantic_dirty = torch.tensor([False], dtype=torch.bool)
-
     prepared.x = x_aug
     prepared.family_id = torch.tensor([int(family_index)], dtype=torch.long)
     prepared.step_context = _build_phase3_step_context(step_index, expected_j_steps)
@@ -310,7 +321,11 @@ def _prepare_graph_for_surrogate(
     return prepared
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 图结构验证
+# ──────────────────────────────────────────────────────────────────────────────
 def _sorted_undirected_edges(edge_index: torch.Tensor):
+    """从有向边索引中提取去重排序的无向边列表（去除自环）。"""
     edges = set()
     for u, v in edge_index.detach().cpu().numpy().T.tolist():
         if u == v:
@@ -321,6 +336,7 @@ def _sorted_undirected_edges(edge_index: torch.Tensor):
 
 
 def _orientation(a, b, c, eps: float):
+    """三点定向：0=共线, 1=左侧(逆时针), -1=右侧(顺时针)。"""
     value = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
     if abs(value) <= eps:
         return 0
@@ -328,6 +344,7 @@ def _orientation(a, b, c, eps: float):
 
 
 def _on_segment(a, b, c, eps: float):
+    """判断共线的点 c 是否在线段 ab 上。"""
     return (
         min(a[0], b[0]) - eps <= c[0] <= max(a[0], b[0]) + eps
         and min(a[1], b[1]) - eps <= c[1] <= max(a[1], b[1]) + eps
@@ -335,6 +352,7 @@ def _on_segment(a, b, c, eps: float):
 
 
 def _segments_intersect(p1, p2, p3, p4, eps: float):
+    """判断两条线段 (p1,p2) 和 (p3,p4) 是否相交。"""
     o1 = _orientation(p1, p2, p3, eps)
     o2 = _orientation(p1, p2, p4, eps)
     o3 = _orientation(p3, p4, p1, eps)
@@ -354,6 +372,10 @@ def _segments_intersect(p1, p2, p3, p4, eps: float):
 
 
 def validate_graph_structure(graph_data: Data, constraint_cfg: Optional[dict] = None):
+    """
+    验证图结构的物理合法性：节点重叠、最小杆件长度、边交叉、关键点索引。
+    返回 (is_valid, info_dict)。
+    """
     constraint_cfg = constraint_cfg or {}
     min_link_length = float(constraint_cfg.get('min_link_length', 0.05))
     min_node_distance = float(constraint_cfg.get('min_node_distance', 1e-3))
@@ -362,6 +384,7 @@ def validate_graph_structure(graph_data: Data, constraint_cfg: Optional[dict] = 
     pos = _to_numpy(graph_data.pos if getattr(graph_data, 'pos', None) is not None else graph_data.x[:, :2])
     x = _to_numpy(graph_data.x)
     edge_index = graph_data.edge_index
+
     if pos.ndim != 2 or pos.shape[1] != 2:
         return False, {'reason': 'invalid_position_shape'}
     if x.shape[0] != pos.shape[0]:
@@ -377,7 +400,6 @@ def validate_graph_structure(graph_data: Data, constraint_cfg: Optional[dict] = 
     undirected_edges = _sorted_undirected_edges(edge_index)
     if not undirected_edges:
         return False, {'reason': 'no_undirected_edges'}
-
     for u, v in undirected_edges:
         if np.linalg.norm(pos[u] - pos[v]) < min_link_length:
             return False, {'reason': 'short_edge', 'edge': (u, v)}
@@ -401,31 +423,25 @@ def validate_graph_structure(graph_data: Data, constraint_cfg: Optional[dict] = 
     return True, {'reason': 'ok'}
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Reward 计算
+# ──────────────────────────────────────────────────────────────────────────────
 def compute_reward(surrogate, graph_data: Data, target: dict,
                    reward_cfg: dict, device, constraint_cfg: Optional[dict] = None, readout_assigner=None) -> tuple:
-    """
-    Single-graph reward computation (fallback path).
-    """
+    """单图奖励计算（回退路径）。返回 (reward, is_valid, info)。"""
     is_valid, valid_info = validate_graph_structure(graph_data, constraint_cfg)
     if not is_valid:
         return reward_cfg.get('penalty_locking', -100.0), False, valid_info
 
     try:
         assigner = readout_assigner or _build_surrogate_readout_assigner(
-            surrogate,
-            reward_cfg,
-            device,
-            family_index=-1,
-            step_index=0,
-            expected_j_steps=1,
+            surrogate, reward_cfg, device,
+            family_index=-1, step_index=0, expected_j_steps=1,
         )
         prepared_graph = _prepare_graph_for_surrogate(
             graph_data,
-            family_index=-1,
-            step_index=0,
-            expected_j_steps=1,
-            target=target,
-            readout_assigner=assigner,
+            family_index=-1, step_index=0, expected_j_steps=1,
+            target=target, readout_assigner=assigner,
         )
         batch = Batch.from_data_list([prepared_graph]).to(device)
         with torch.no_grad():
@@ -437,11 +453,8 @@ def compute_reward(surrogate, graph_data: Data, target: dict,
         return reward_cfg.get('penalty_locking', -100.0), False, {}
 
     reward_t, metrics = compute_reward_batch(
-        pred_foot.unsqueeze(0),
-        pred_knee.unsqueeze(0),
-        pred_ankle.unsqueeze(0),
-        target,
-        reward_cfg,
+        pred_foot.unsqueeze(0), pred_knee.unsqueeze(0), pred_ankle.unsqueeze(0),
+        target, reward_cfg,
     )
     total_reward = float(reward_t.squeeze(0).item())
     info = {
@@ -461,8 +474,8 @@ def compute_reward(surrogate, graph_data: Data, target: dict,
 def batch_compute_rewards(surrogate, graphs: list, target: dict,
                           reward_cfg: dict, device, constraint_cfg: Optional[dict] = None, readout_assigner=None) -> list:
     """
-    Batch-compute rewards for a list of graphs in ONE GPU call.
-    Returns list of (reward, valid) tuples.
+    批量计算多个图的奖励（单次 GPU 调用）。
+    批量推理失败时回退到逐图计算。
     """
     if not graphs:
         return []
@@ -484,17 +497,11 @@ def batch_compute_rewards(surrogate, graphs: list, target: dict,
     prepared_graphs = [
         _prepare_graph_for_surrogate(
             graph,
-            family_index=-1,
-            step_index=0,
-            expected_j_steps=1,
+            family_index=-1, step_index=0, expected_j_steps=1,
             target=target,
             readout_assigner=readout_assigner or _build_surrogate_readout_assigner(
-                surrogate,
-                reward_cfg,
-                device,
-                family_index=-1,
-                step_index=0,
-                expected_j_steps=1,
+                surrogate, reward_cfg, device,
+                family_index=-1, step_index=0, expected_j_steps=1,
             ),
         )
         for graph in valid_graphs
@@ -513,13 +520,8 @@ def batch_compute_rewards(surrogate, graphs: list, target: dict,
     except Exception:
         for idx, prepared_graph in zip(valid_indices, prepared_graphs):
             reward, valid, _ = compute_reward(
-                surrogate,
-                prepared_graph,
-                target,
-                reward_cfg,
-                device,
-                constraint_cfg=constraint_cfg,
-                readout_assigner=readout_assigner,
+                surrogate, prepared_graph, target, reward_cfg, device,
+                constraint_cfg=constraint_cfg, readout_assigner=readout_assigner,
             )
             results[idx] = (reward if valid else penalty, valid)
         return results
@@ -540,10 +542,8 @@ def batch_compute_phase5_rewards(
     readout_assigner=None,
 ) -> tuple[list[tuple[float, bool]], list[dict[str, float]]]:
     """
-    Strategy-A phase5 reward:
-      - illegal / invalid graph: immediate negative terminal reward
-      - intermediate valid step: small alive bonus or 0
-      - terminal valid graph: foot/knee/ankle match - uncertainty - step penalty
+    Phase5 专用批量奖励计算。
+    非法图返回惩罚值；中间步返回 alive_bonus；终止步计算综合奖励。
     """
     if not graphs:
         return [], []
@@ -569,14 +569,9 @@ def batch_compute_phase5_rewards(
     base_rewards = [r_invalid_penalty] * len(graphs)
     metric_payloads = [
         {
-            'r_foot': 0.0,
-            'r_knee': 0.0,
-            'r_ankle': 0.0,
-            'r_uncertainty': 0.0,
-            'r_step_penalty': 0.0,
-            'reward_total': r_invalid_penalty,
-            'valid': 0.0,
-            'terminal': 0.0,
+            'r_foot': 0.0, 'r_knee': 0.0, 'r_ankle': 0.0,
+            'r_uncertainty': 0.0, 'r_step_penalty': 0.0,
+            'reward_total': r_invalid_penalty, 'valid': 0.0, 'terminal': 0.0,
         }
         for _ in graphs
     ]
@@ -586,9 +581,7 @@ def batch_compute_phase5_rewards(
         for graph, graph_idx in zip(valid_graphs, valid_graph_indices):
             step_index = int(step_indices[graph_idx])
             assigner = readout_assigner or _build_surrogate_readout_assigner(
-                surrogate,
-                reward_cfg,
-                device,
+                surrogate, reward_cfg, device,
                 family_index=int(family_index),
                 step_index=step_index,
                 expected_j_steps=int(expected_j_steps),
@@ -610,12 +603,9 @@ def batch_compute_phase5_rewards(
         pred_knee_cpu = pred_knee.cpu()
         pred_ankle_cpu = pred_ankle.cpu()
         metrics = compute_joint_metrics_batch(
-            pred_foot_cpu,
-            pred_knee_cpu,
-            pred_ankle_cpu,
-            target,
-            reward_cfg,
+            pred_foot_cpu, pred_knee_cpu, pred_ankle_cpu, target, reward_cfg,
         )
+
         for local_idx, graph_idx in enumerate(valid_graph_indices):
             step_index = int(step_indices[graph_idx])
             stop_selected = bool(stop_flags[graph_idx])
@@ -624,6 +614,7 @@ def batch_compute_phase5_rewards(
             ankle_reward = max(0.0, 1.0 - float(metrics['ankle_nrmse'][local_idx].item()))
             uncertainty = 0.0
             step_penalty = step_penalty_weight * float(abs(int(expected_j_steps) - step_index))
+
             if stop_selected or step_index >= int(expected_j_steps):
                 total_reward = (
                     w_foot * foot_reward
@@ -634,6 +625,7 @@ def batch_compute_phase5_rewards(
                 )
             else:
                 total_reward = alive_bonus
+
             base_rewards[graph_idx] = total_reward
             metric_payloads[graph_idx] = {
                 'r_foot': foot_reward,
@@ -656,20 +648,20 @@ def batch_compute_phase5_rewards(
 # ──────────────────────────────────────────────────────────────────────────────
 # J-Operator：将新 Dyad 嵌入当前图
 # ──────────────────────────────────────────────────────────────────────────────
+# 节点顺序：0=地铰, 1=曲柄, 2=连杆, 3=摇杆
 FIXED_4BAR_ADJACENCY = [
-    (0, 1), (1, 0),   # 地铰-曲柄
-    (1, 2), (2, 1),   # 曲柄-连杆
-    (2, 3), (3, 2),   # 连杆-摇杆
-    (3, 0), (0, 3),   # 摇杆-地铰
+    (0, 1), (1, 0),
+    (1, 2), (2, 1),
+    (2, 3), (3, 2),
+    (3, 0), (0, 3),
 ]
+
 
 def apply_j_operator(graph_data: Data, u: int, v: int, w: int,
                      n1_pos: np.ndarray, n2_pos: np.ndarray) -> Data:
     """
-    将 J-Operator 应用到当前图:
-      - 在节点 u, v（动节点）中间插入 n1
-      - n2 连接 n1 和固定节点 w
-      返回包含 n1, n2 的新图 Data
+    将 J-Operator 应用到当前图，在动节点 u、v 和固定节点 w 之间插入新 Dyad（双杆组）。
+    返回包含 n1 和 n2 的新图数据（不修改原图）。
     """
     old_x   = graph_data.x.detach().cpu().numpy()
     old_pos = graph_data.pos.detach().cpu().numpy()
@@ -711,6 +703,7 @@ def apply_j_operator(graph_data: Data, u: int, v: int, w: int,
     if keypoints is not None:
         out_kwargs["keypoints"] = keypoints
     out = Data(**out_kwargs)
+
     if hasattr(graph_data, 'knee_idx') and graph_data.knee_idx is not None:
         out.knee_idx = graph_data.knee_idx.clone().detach()
     if semantic_dirty:
@@ -719,22 +712,12 @@ def apply_j_operator(graph_data: Data, u: int, v: int, w: int,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MDP 环境类（延迟 reward 计算版本）
+# MDP 环境类
 # ──────────────────────────────────────────────────────────────────────────────
 class MechanismEnv:
     """
-    自回归机构图构建 MDP 环境
-
-    Episode 流程：
-      reset(target, base_graph) → 初始 state (4杆)
-      step(action) → next_state, reward, done, info
-      - action = {'u':int, 'v':int, 'w':int,
-                   'n1': np.ndarray(2,), 'n2': np.ndarray(2,)}
-      达到 max_steps 或 reward 超阈值后 done=True
-
-    Deferred reward mode:
-      step() 只做 J-Operator（纯 CPU），不调 surrogate → reward 占位为 0
-      episode 结束后调 compute_episode_rewards() 一次性 batch 计算
+    自回归机构图构建的 MDP 环境。
+    每步选择 J-Operator 动作插入新 Dyad，支持延迟 reward 模式。
     """
 
     def __init__(self, surrogate, reward_cfg: dict, max_steps: int = 5, device='cpu', constraint_cfg: Optional[dict] = None):
@@ -770,6 +753,7 @@ class MechanismEnv:
         expected_j_steps: int | None = None,
         fixed_stop_by_family: bool = True,
     ):
+        """重置环境并开始新的 episode。返回初始观测。"""
         self._reset_state()
         self.current_graph = copy.deepcopy(base_graph)
         self.target        = target
@@ -784,6 +768,7 @@ class MechanismEnv:
         return self._get_obs()
 
     def _get_obs(self):
+        """返回当前观测字典。"""
         return {
             'graph': self.current_graph,
             'z_c': self.z_c,
@@ -797,8 +782,9 @@ class MechanismEnv:
 
     def step(self, action: dict):
         """
-        Execute one phase5 RL action. Reward is deferred and evaluated on the
-        reached graph plus terminal stop bonus.
+        执行一步 RL 动作。
+        stop=True 时结束 episode；否则执行 J-Operator 插入新 Dyad。
+        延迟 reward 模式下 reward 占位为 0。返回 (obs, reward, done, info)。
         """
         if self.done:
             raise RuntimeError("Environment is done. Call reset() first.")
@@ -846,9 +832,7 @@ class MechanismEnv:
         return self._get_obs(), 0.0, self.done, reward_info
 
     def compute_episode_rewards(self) -> list:
-        """
-        Batch-compute phase5 rewards for all executed steps.
-        """
+        """批量计算 episode 中所有步的 reward。返回 (results, payloads)。"""
         if not self._reward_events:
             return [], []
         results, payloads = batch_compute_phase5_rewards(
@@ -870,10 +854,11 @@ class MechanismEnv:
         return self.current_graph.x.size(0) if self.current_graph else 0
 
     def get_valid_j_operator_actions(self):
+        """枚举当前图所有合法的 (u, v, w) 拓扑动作（u < v）。"""
         x = self.current_graph.x.numpy()
         is_fixed = x[:, 2]
-        moving_nodes = [i for i in range(len(is_fixed)) if is_fixed[i] == 0]
-        fixed_nodes  = [i for i in range(len(is_fixed)) if is_fixed[i] == 1]
+        moving_nodes = [i for i, value in enumerate(is_fixed) if value == 0]
+        fixed_nodes = [i for i, value in enumerate(is_fixed) if value == 1]
 
         actions = []
         for i_u, u in enumerate(moving_nodes):

@@ -5,7 +5,7 @@ import sys
 import torch
 from torch_geometric.data import Data
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from src.inverse.experiment_utils import compute_joint_metrics_batch, select_hard_test_indices
 from src.inverse.rl_env import apply_j_operator, validate_graph_structure

@@ -1,24 +1,26 @@
+"""前向模型评估指标与训练损失，包括单项指标、批量计算、模型评估、检索基线和语义消融。"""
+
 from __future__ import annotations
-
 from collections import defaultdict
-
 import torch
 from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader
-
 from src.forward_dataset_utils import family_id_to_name
 
 
 def _target_curve_range(target: torch.Tensor) -> torch.Tensor:
+    """计算目标曲线值域 (max-min)，下限clamp到1e-6防除零。"""
     flat = target.reshape(target.size(0), -1)
     return torch.clamp(flat.max(dim=1).values - flat.min(dim=1).values, min=1e-6)
 
 
 def foot_path_error(pred_foot: torch.Tensor, target_foot: torch.Tensor) -> torch.Tensor:
+    """足端轨迹L2路径误差，对坐标维取范数后对时间维求均值。"""
     return torch.norm(pred_foot - target_foot, dim=-1).mean(dim=1)
 
 
 def foot_chamfer_distance(pred_foot: torch.Tensor, target_foot: torch.Tensor) -> torch.Tensor:
+    """足端轨迹倒角距离，双向最近点距离的平均值。"""
     distances = torch.cdist(pred_foot.float(), target_foot.float())
     d1 = distances.min(dim=2).values.mean(dim=1)
     d2 = distances.min(dim=1).values.mean(dim=1)
@@ -26,11 +28,13 @@ def foot_chamfer_distance(pred_foot: torch.Tensor, target_foot: torch.Tensor) ->
 
 
 def curve_nmae(pred_curve: torch.Tensor, target_curve: torch.Tensor) -> torch.Tensor:
+    """曲线归一化MAE = MAE / target_range，便于不同量纲曲线横向比较。"""
     mae = torch.mean(torch.abs(pred_curve - target_curve), dim=1)
     return mae / _target_curve_range(target_curve)
 
 
 def semantic_curve_std_ratio(pred_curve: torch.Tensor, target_curve: torch.Tensor) -> torch.Tensor:
+    """预测/目标曲线标准差比值，接近1.0表示动态范围一致。"""
     pred_std = torch.std(pred_curve, dim=1, unbiased=False)
     target_std = torch.clamp(torch.std(target_curve, dim=1, unbiased=False), min=1e-6)
     return pred_std / target_std
@@ -44,6 +48,7 @@ def compute_forward_metrics_batch(
     target_knee: torch.Tensor,
     target_ankle: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
+    """批量计算6项前向指标：foot_path_error, foot_chamfer, knee/ankle_nmae, knee/ankle_std_ratio。"""
     return {
         "foot_path_error": foot_path_error(pred_foot, target_foot),
         "foot_chamfer": foot_chamfer_distance(pred_foot, target_foot),
@@ -55,9 +60,10 @@ def compute_forward_metrics_batch(
 
 
 def _mean_metrics(metric_rows: list[dict[str, float]]) -> dict[str, float]:
+    """对多行指标取均值，返回汇总字典。"""
     if not metric_rows:
         return {}
-    keys = sorted(metric_rows[0].keys())
+    keys = sorted(metric_rows[0])
     return {
         key: float(sum(row[key] for row in metric_rows) / len(metric_rows))
         for key in keys
@@ -65,6 +71,7 @@ def _mean_metrics(metric_rows: list[dict[str, float]]) -> dict[str, float]:
 
 
 def _sample_family_id(data, sample_idx: int) -> int:
+    """从batched Data对象中提取指定样本的机构族ID。"""
     family_id = getattr(data, "family_id", None)
     if family_id is None:
         return -1
@@ -74,6 +81,7 @@ def _sample_family_id(data, sample_idx: int) -> int:
 
 
 def compute_loss(pred_foot, pred_knee, pred_ankle, data, config):
+    """加权MSE损失，权重通过config中的 w_foot/w_knee/w_ankle 配置。返回 (total, foot, knee, ankle)。"""
     import torch.nn.functional as F
 
     w_foot = config.get("w_foot", 1.0)
@@ -88,6 +96,7 @@ def compute_loss(pred_foot, pred_knee, pred_ankle, data, config):
 
 
 def evaluate_forward_model(model, data_items, config, device, batch_size=256) -> dict[str, object]:
+    """评估前向模型，返回整体和按族分组的指标。config需含 "training" 子字典。"""
     if not data_items:
         return {"sample_count": 0, "overall": {}, "per_family": {}}
 
@@ -104,9 +113,7 @@ def evaluate_forward_model(model, data_items, config, device, batch_size=256) ->
             pred_foot, pred_knee, pred_ankle = model(data)
             loss, _, _, _ = compute_loss(pred_foot, pred_knee, pred_ankle, data, config.get("training", {}))
             metrics = compute_forward_metrics_batch(
-                pred_foot,
-                pred_knee,
-                pred_ankle,
+                pred_foot, pred_knee, pred_ankle,
                 data.y_foot.view_as(pred_foot),
                 data.y_knee.view_as(pred_knee),
                 data.y_ankle.view_as(pred_ankle),
@@ -114,8 +121,7 @@ def evaluate_forward_model(model, data_items, config, device, batch_size=256) ->
             total_loss += float(loss.item())
             total_batches += 1
 
-            batch_size_actual = pred_foot.size(0)
-            for sample_idx in range(batch_size_actual):
+            for sample_idx in range(pred_foot.size(0)):
                 row = {name: float(values[sample_idx].item()) for name, values in metrics.items()}
                 metric_rows.append(row)
                 family_name = family_id_to_name(_sample_family_id(data, sample_idx))
@@ -125,20 +131,14 @@ def evaluate_forward_model(model, data_items, config, device, batch_size=256) ->
     if overall:
         overall["loss_total"] = float(total_loss / max(total_batches, 1))
     per_family = {
-        family_name: {
-            **_mean_metrics(rows),
-            "sample_count": len(rows),
-        }
-        for family_name, rows in sorted(family_rows.items())
+        fname: {**_mean_metrics(rows), "sample_count": len(rows)}
+        for fname, rows in sorted(family_rows.items())
     }
-    return {
-        "sample_count": len(metric_rows),
-        "overall": overall,
-        "per_family": per_family,
-    }
+    return {"sample_count": len(metric_rows), "overall": overall, "per_family": per_family}
 
 
 def evaluate_retrieval_baseline(train_items, eval_items) -> dict[str, object]:
+    """最近邻检索基线：用检索特征L2距离找最近邻，以邻近样本曲线作为预测。"""
     if not train_items or not eval_items:
         return {"sample_count": 0, "overall": {}, "per_family": {}}
 
@@ -159,14 +159,7 @@ def evaluate_retrieval_baseline(train_items, eval_items) -> dict[str, object]:
         target_knee = eval_item.y_knee.unsqueeze(0)
         target_ankle = eval_item.y_ankle.unsqueeze(0)
 
-        metrics = compute_forward_metrics_batch(
-            pred_foot,
-            pred_knee,
-            pred_ankle,
-            target_foot,
-            target_knee,
-            target_ankle,
-        )
+        metrics = compute_forward_metrics_batch(pred_foot, pred_knee, pred_ankle, target_foot, target_knee, target_ankle)
         row = {name: float(values[0].item()) for name, values in metrics.items()}
         metric_rows.append(row)
         family_name = family_id_to_name(_sample_family_id(eval_item, 0))
@@ -176,16 +169,14 @@ def evaluate_retrieval_baseline(train_items, eval_items) -> dict[str, object]:
         "sample_count": len(metric_rows),
         "overall": _mean_metrics(metric_rows),
         "per_family": {
-            family_name: {
-                **_mean_metrics(rows),
-                "sample_count": len(rows),
-            }
-            for family_name, rows in sorted(family_rows.items())
+            fname: {**_mean_metrics(rows), "sample_count": len(rows)}
+            for fname, rows in sorted(family_rows.items())
         },
     }
 
 
 def evaluate_semantic_ablation(model, data_items, config, device, batch_size=256) -> dict[str, float]:
+    """语义消融实验：将语义通道和掩码置零后评估，返回各指标退化比（>1表示退化）。"""
     if not data_items:
         return {}
 
@@ -195,16 +186,14 @@ def evaluate_semantic_ablation(model, data_items, config, device, batch_size=256
         clone.x = clone.x.clone()
         if clone.x.size(-1) >= 8:
             clone.x[:, -4:] = 0.0
-        if hasattr(clone, "mask_foot"):
-            clone.mask_foot = torch.zeros_like(clone.mask_foot)
-        if hasattr(clone, "mask_knee"):
-            clone.mask_knee = torch.zeros_like(clone.mask_knee)
-        if hasattr(clone, "mask_ankle"):
-            clone.mask_ankle = torch.zeros_like(clone.mask_ankle)
+        for mask_name in ("mask_foot", "mask_knee", "mask_ankle"):
+            if hasattr(clone, mask_name):
+                setattr(clone, mask_name, torch.zeros_like(getattr(clone, mask_name)))
         degraded_items.append(clone)
 
     base_report = evaluate_forward_model(model, data_items, config, device, batch_size=batch_size)
     ablated_report = evaluate_forward_model(model, degraded_items, config, device, batch_size=batch_size)
+
     output = {}
     for metric_name in ("foot_path_error", "foot_chamfer", "knee_nmae", "ankle_nmae"):
         base_value = base_report["overall"].get(metric_name, 0.0)
@@ -214,6 +203,7 @@ def evaluate_semantic_ablation(model, data_items, config, device, batch_size=256
 
 
 def phase3_gate(report: dict[str, object], gate_cfg: dict[str, float] | None = None) -> dict[str, object]:
+    """Phase3门控：判断前向模型是否达到进入RL阶段的标准（超越基线、族均衡、8/9杆可控、语义未坍塌）。"""
     gate_cfg = gate_cfg or {}
     primary_foot_metric = gate_cfg.get("primary_foot_metric", "foot_path_error")
     family_ratio_limit = float(gate_cfg.get("max_family_metric_ratio", 1.8))
@@ -226,6 +216,7 @@ def phase3_gate(report: dict[str, object], gate_cfg: dict[str, float] | None = N
     per_family = current.get("test", {}).get("per_family", {})
     semantic_ablation = report.get("semantic_ablation", {})
 
+    # 是否在所有基线方法上不劣于
     stronger_than = {}
     for baseline_name, baseline_report in baselines.items():
         baseline_overall = baseline_report.get("test", {}).get("overall", {})
@@ -233,31 +224,34 @@ def phase3_gate(report: dict[str, object], gate_cfg: dict[str, float] | None = N
             stronger_than[baseline_name] = False
             continue
         stronger_than[baseline_name] = all(
-            overall.get(metric_name, float("inf")) <= baseline_overall.get(metric_name, float("inf"))
-            for metric_name in (primary_foot_metric, "knee_nmae", "ankle_nmae")
+            overall.get(m, float("inf")) <= baseline_overall.get(m, float("inf"))
+            for m in (primary_foot_metric, "knee_nmae", "ankle_nmae")
         )
 
+    # 族间均衡性：最差/最优比值超阈值则失衡
     family_metric_values = [
         metrics.get(primary_foot_metric, 0.0)
-        for family_name, metrics in per_family.items()
-        if family_name != "unknown"
+        for fname, metrics in per_family.items()
+        if fname != "unknown"
     ]
     family_imbalance = False
     if family_metric_values:
         family_imbalance = max(family_metric_values) / max(min(family_metric_values), 1e-6) > family_ratio_limit
 
+    # 8/9杆失控检查
     out_of_control_families = []
     for family_name in ("8bar", "9bar"):
         metrics = per_family.get(family_name, {})
         if not metrics:
             continue
         if any(
-            metrics.get(metric_name, 0.0) > overall.get(metric_name, 0.0) * bar89_multiplier
-            for metric_name in (primary_foot_metric, "knee_nmae", "ankle_nmae")
-            if overall.get(metric_name) is not None
+            metrics.get(m, 0.0) > overall.get(m, 0.0) * bar89_multiplier
+            for m in (primary_foot_metric, "knee_nmae", "ankle_nmae")
+            if overall.get(m) is not None
         ):
             out_of_control_families.append(family_name)
 
+    # 语义坍塌检查
     semantic_collapse = any(
         value > semantic_ablation_limit
         for key, value in semantic_ablation.items()

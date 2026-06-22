@@ -1,6 +1,6 @@
-﻿# src/inverse/train_il.py
-# IL 琛屼负鍏嬮殕璁粌寰幆锛堝叏鍚戦噺鍖栨壒閲忕増鏈級
-# 浠?pkl 鐨?gen_info 涓彁鍙栦笓瀹惰矾寰勶紝浣跨敤瀹屽叏鎵归噺鍖栫殑 PyG 鍓嶅悜浼犳挱璁粌 GNN Policy
+"""模仿学习（Behavioral Cloning）训练模块。从 pkl 数据集提取专家动作，训练 GNN Policy
+学习拓扑动作（锚点选择）和几何动作（新节点坐标预测，C-VAE）。"""
+# src/inverse/train_il.py
 
 import pickle
 import os
@@ -16,6 +16,7 @@ from src.kinematics_extract import extract_kinematics
 
 
 def _resolve_semantic_action(sample: dict):
+    """从样本中解析语义动作 (u, v, w, n1, n2)。优先从 gen_info 读取，回退到 generation_trace。"""
     analysis = sample['analysis']
     gen_info = sample.get('gen_info') or analysis.get('gen_info')
     if gen_info is not None:
@@ -55,6 +56,7 @@ def _resolve_semantic_action(sample: dict):
 
 
 def _batch_offsets(base_data):
+    """获取 PyG Batch 中各子图的起始节点偏移量。"""
     ptr = getattr(base_data, 'ptr', None)
     if ptr is not None:
         return ptr[:-1].to(dtype=torch.long, device=base_data.x.device)
@@ -62,23 +64,15 @@ def _batch_offsets(base_data):
 
 
 def _batch_graph_slices(base_data):
+    """获取批量图中各子图的 (start, end) 节点切片范围。"""
     ptr = getattr(base_data, 'ptr', None)
     if ptr is not None:
         return [(int(ptr[i].item()), int(ptr[i + 1].item())) for i in range(ptr.numel() - 1)]
     return [(0, int(base_data.x.size(0)))]
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# 涓撳璺緞鎻愬彇锛氫粠 6 鏉?pkl 鏍锋湰閲嶅缓 4 鏉?鈫?6 鏉?鐨勪笓瀹跺姩浣?
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 def extract_expert_paths(pkl_path: str, output_path: str):
-    """
-    璇诲彇 pkl锛屼负姣忎釜鏍锋湰鎻愬彇 IL 鐘舵€?鍔ㄤ綔瀵?
-      state        = 4 鏉嗗浘鐨?PyG Data (鍘绘帀 n1, n2 鍙婂叾杩炶竟)
-      action_topo  = (u, v, w) 鎸傝浇鐐圭储寮曪紙鐩稿浜?4 鏉嗚妭鐐归泦鍚堬級
-      action_geo   = (n1.x, n1.y, n2.x, n2.y) 鏂拌妭鐐瑰綊涓€鍖栧潗鏍?
-      condition    = (y_foot, y_knee, y_ankle) 鐩爣鏇茬嚎
-    """
+    """从 pkl 数据集提取 IL 专家路径。为每个样本构建 4 节点基础图、拓扑动作和几何动作。"""
     print(f"Loading pkl from {pkl_path} ...")
     with open(pkl_path, 'rb') as f:
         raw_data = pickle.load(f)
@@ -106,7 +100,7 @@ def extract_expert_paths(pkl_path: str, output_path: str):
             n1 = semantic_action['n1']
             n2 = semantic_action['n2']
 
-            # Remove the semantic dyad to recover the graph state immediately before the semantic step.
+            # 移除 n1, n2，恢复 4 节点基础图
             base_nodes = [i for i in range(A.shape[0]) if i not in (n1, n2)]
             node_remap = {old: new for new, old in enumerate(base_nodes)}
 
@@ -119,7 +113,7 @@ def extract_expert_paths(pkl_path: str, output_path: str):
 
             is_fixed = (types_base == 1).astype(np.float32)
             is_grounded = np.zeros_like(is_fixed)
-            is_grounded[0] = 1
+            is_grounded[0] = 1.0
             x_feat = np.column_stack([x0_base, is_fixed, is_grounded])
 
             base_data = Data(
@@ -131,7 +125,6 @@ def extract_expert_paths(pkl_path: str, output_path: str):
             if knee_idx in node_remap:
                 base_data.knee_idx = torch.tensor([node_remap[knee_idx]], dtype=torch.long)
 
-            # 鈹€鈹€ 鍔ㄤ綔 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
             u_r = node_remap.get(u)
             v_r = node_remap.get(v)
             w_r = node_remap.get(w)
@@ -145,11 +138,10 @@ def extract_expert_paths(pkl_path: str, output_path: str):
                 dtype=torch.float32
             )
 
-            # 鈹€鈹€ 鐩爣鏇茬嚎锛堟潯浠讹級鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
             foot_traj, knee_angle, ankle_angle = extract_kinematics(sample)
-            y_foot = torch.tensor(foot_traj, dtype=torch.float32)    # (200, 2)
-            y_knee = torch.tensor(knee_angle, dtype=torch.float32)   # (200,)
-            y_ankle = torch.tensor(ankle_angle, dtype=torch.float32) # (200,)
+            y_foot = torch.tensor(foot_traj, dtype=torch.float32)
+            y_knee = torch.tensor(knee_angle, dtype=torch.float32)
+            y_ankle = torch.tensor(ankle_angle, dtype=torch.float32)
 
             expert_paths.append({
                 'sample_id': sample_idx,
@@ -180,6 +172,7 @@ def extract_expert_paths(pkl_path: str, output_path: str):
 
 
 def expert_paths_have_semantics(expert_paths) -> bool:
+    """检查专家路径是否包含膝关节语义信息。"""
     if not expert_paths:
         return False
     base_data = expert_paths[0].get('base_data')
@@ -187,6 +180,7 @@ def expert_paths_have_semantics(expert_paths) -> bool:
 
 
 def ensure_expert_paths(pkl_path: str, output_path: str, use_cached: bool = True):
+    """确保专家路径数据可用。缓存有效则加载，否则重新提取。"""
     if use_cached and os.path.exists(output_path):
         print(f"[*] Loading cached IL dataset from {output_path}")
         expert_paths = torch.load(output_path, map_location='cpu', weights_only=False)
@@ -194,16 +188,12 @@ def ensure_expert_paths(pkl_path: str, output_path: str, use_cached: bool = True
             return expert_paths
         print("[*] Cached IL dataset is missing knee semantics; regenerating...")
 
-    return extract_expert_paths(
-        pkl_path=pkl_path,
-        output_path=output_path,
-    )
+    return extract_expert_paths(pkl_path=pkl_path, output_path=output_path)
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# IL Dataset
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 class ILDataset(Dataset):
+    """模仿学习数据集，封装专家路径列表供 DataLoader 使用。"""
+
     def __init__(self, paths):
         self.paths = paths
 
@@ -214,22 +204,21 @@ class ILDataset(Dataset):
         return self.paths[idx]
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# 鎵归噺璁＄畻 IL 鎹熷け锛堝叏鍚戦噺鍖栵紝鍋囪鎵€鏈夊浘 4 鑺傜偣锛?
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 def compute_il_metrics_batched(topo_scores_all, action_topo,
                                geo_pred, geo_mu, geo_logvar, true_geo, cfg,
                                nodes_per_graph=4, geo_prior_pred=None,
                                base_data=None,
                                geo_prior_regularizer_post=None,
                                geo_prior_regularizer_prior=None):
-    """Return decomposed IL losses for both posterior and prior geometry paths."""
+    """批量计算 IL 各项损失指标。返回拓扑损失、几何损失（后验+先验）、正则化等分量。"""
     il_cfg = cfg.get('il_training', cfg)
     w_topo = il_cfg.get('w_topology', 1.0)
     w_geo  = il_cfg.get('w_geometry', 1.0)
     beta   = cfg.get('cvae', {}).get('beta', 1.0)
 
     scores = topo_scores_all.squeeze(-1)
+
+    # ─── 拓扑损失 ────────────────────────────────────────────
     if base_data is None:
         B = action_topo.size(0)
         expected_num_scores = B * nodes_per_graph
@@ -262,19 +251,24 @@ def compute_il_metrics_batched(topo_scores_all, action_topo,
         topo_targets[global_action.reshape(-1)] = 1.0
         loss_topo = nn.functional.binary_cross_entropy_with_logits(scores, topo_targets)
 
+    # ─── 几何损失（C-VAE 后验）──────────────────────────────
     loss_recon = nn.functional.mse_loss(geo_pred, true_geo)
     loss_kl = -0.5 * torch.mean(1 + geo_logvar - geo_mu.pow(2) - geo_logvar.exp())
     loss_geo = loss_recon + beta * loss_kl
 
+    # ─── 先验几何损失 ────────────────────────────────────────
     loss_geo_prior = None
     if geo_prior_pred is not None:
         loss_geo_prior = nn.functional.mse_loss(geo_prior_pred, true_geo)
 
+    # ─── 正则化项 ────────────────────────────────────────────
     prior_weight = il_cfg.get('w_geometry_prior', 0.0)
     reg_weight = il_cfg.get('w_geometry_prior_regularizer', 0.0)
     reg_post = geo_prior_regularizer_post if geo_prior_regularizer_post is not None else torch.zeros_like(loss_recon)
     reg_prior = geo_prior_regularizer_prior if geo_prior_regularizer_prior is not None else torch.zeros_like(loss_recon)
     loss_geo_regularizer = 0.5 * reg_post + reg_prior
+
+    # ─── 总损失 ──────────────────────────────────────────────
     total_posterior = w_topo * loss_topo + w_geo * loss_geo
     total_prior = (
         w_topo * loss_topo
@@ -306,6 +300,7 @@ def compute_il_metrics_batched(topo_scores_all, action_topo,
 def compute_il_loss_batched(topo_scores_all, action_topo,
                             geo_pred, geo_mu, geo_logvar, true_geo, cfg,
                             nodes_per_graph=4, base_data=None):
+    """批量计算 IL 总损失，返回 (total_loss, topo_loss, geo_loss)。"""
     metrics = compute_il_metrics_batched(
         topo_scores_all, action_topo,
         geo_pred, geo_mu, geo_logvar, true_geo, cfg,
@@ -317,12 +312,7 @@ def compute_il_loss_batched(topo_scores_all, action_topo,
 
 
 def _build_geo_conditions(x_enc, action_topo, z_c, base_data=None, nodes_per_graph=4):
-    """
-    鏋勯€?C-VAE 鏉′欢鍚戦噺锛堟壒閲忥級
-    x_enc       : (N_total, hidden_dim)
-    action_topo : (B, 3)
-    z_c         : (B, latent_dim)
-    """
+    """构造 C-VAE 条件向量：锚点 (u,v,w) 特征均值与曲线编码拼接。"""
     B = action_topo.size(0)
     if base_data is None:
         expected_num_nodes = B * nodes_per_graph
@@ -344,11 +334,12 @@ def _build_geo_conditions(x_enc, action_topo, z_c, base_data=None, nodes_per_gra
         u_f = x_enc[global_action[:, 0]]
         v_f = x_enc[global_action[:, 1]]
         w_f = x_enc[global_action[:, 2]]
-    uvw_feat = (u_f + v_f + w_f) / 3.0                           # (B, hidden)
-    return torch.cat([uvw_feat, z_c], dim=-1)                     # (B, cond_dim)
+    uvw_feat = (u_f + v_f + w_f) / 3.0
+    return torch.cat([uvw_feat, z_c], dim=-1)
 
 
 def _local_undirected_edges(edge_index):
+    """从边索引中提取去重的无向边集合。"""
     edges = set()
     for u, v in edge_index.detach().cpu().numpy().T.tolist():
         lu = int(u)
@@ -361,6 +352,7 @@ def _local_undirected_edges(edge_index):
 
 
 def _point_to_segment_distance(points, seg_start, seg_end):
+    """计算点到线段的最短距离（投影法）。"""
     seg_vec = seg_end - seg_start
     seg_len_sq = torch.sum(seg_vec * seg_vec, dim=-1, keepdim=True).clamp_min(1e-8)
     t = torch.sum((points - seg_start) * seg_vec, dim=-1, keepdim=True) / seg_len_sq
@@ -370,6 +362,7 @@ def _point_to_segment_distance(points, seg_start, seg_end):
 
 
 def _segment_clearance_distance(seg_a0, seg_a1, seg_b0, seg_b1):
+    """计算两条线段之间的最小间隙距离（四端点近似）。"""
     dists = torch.stack([
         _point_to_segment_distance(seg_a0, seg_b0, seg_b1),
         _point_to_segment_distance(seg_a1, seg_b0, seg_b1),
@@ -380,6 +373,7 @@ def _segment_clearance_distance(seg_a0, seg_a1, seg_b0, seg_b1):
 
 
 def compute_geometry_prior_regularizer(pred_geo, base_data, action_topo, cfg, nodes_per_graph=4):
+    """计算几何先验正则化惩罚，确保预测杆件满足最小长度、最小间距和线段间隙约束。"""
     constraint_cfg = cfg.get('constraints', {})
     min_link_length = float(constraint_cfg.get('min_link_length', 0.05))
     min_node_distance = float(constraint_cfg.get('min_node_distance', 0.01))
@@ -410,6 +404,7 @@ def compute_geometry_prior_regularizer(pred_geo, base_data, action_topo, cfg, no
         v_pos = local_pos[v_idx]
         w_pos = local_pos[w_idx]
 
+        # 约束1：最小杆件长度
         link_lengths = torch.stack([
             torch.norm(n1 - u_pos, dim=-1),
             torch.norm(n1 - v_pos, dim=-1),
@@ -418,6 +413,7 @@ def compute_geometry_prior_regularizer(pred_geo, base_data, action_topo, cfg, no
         ], dim=-1)
         short_edge_penalty = F.softplus(edge_margin - link_lengths).mean()
 
+        # 约束2：最小节点间距（排除锚点）
         node_mask = torch.ones(local_pos.size(0), dtype=torch.bool, device=pred_geo.device)
         node_mask[u_idx] = False
         node_mask[v_idx] = False
@@ -431,6 +427,7 @@ def compute_geometry_prior_regularizer(pred_geo, base_data, action_topo, cfg, no
                 + F.softplus(node_margin - dist_n2[node_mask]).mean()
             )
 
+        # 约束3：线段间隙
         edge_penalties = []
         local_edges = _local_undirected_edges(local_edge_index)
         candidate_segments = [
@@ -447,21 +444,18 @@ def compute_geometry_prior_regularizer(pred_geo, base_data, action_topo, cfg, no
                 edge_a = local_pos[e_u]
                 edge_b = local_pos[e_v]
                 clearance = _segment_clearance_distance(
-                    seg_a.unsqueeze(0),
-                    seg_b.unsqueeze(0),
-                    edge_a.unsqueeze(0),
-                    edge_b.unsqueeze(0),
+                    seg_a.unsqueeze(0), seg_b.unsqueeze(0),
+                    edge_a.unsqueeze(0), edge_b.unsqueeze(0),
                 )
                 edge_penalties.append(F.softplus(node_margin - clearance).mean())
 
+        # 新杆件之间的自交叉检查
         for idx_a, idx_b in ((0, 3), (1, 3)):
             _, seg_a0, seg_a1 = candidate_segments[idx_a]
             _, seg_b0, seg_b1 = candidate_segments[idx_b]
             clearance = _segment_clearance_distance(
-                seg_a0.unsqueeze(0),
-                seg_a1.unsqueeze(0),
-                seg_b0.unsqueeze(0),
-                seg_b1.unsqueeze(0),
+                seg_a0.unsqueeze(0), seg_a1.unsqueeze(0),
+                seg_b0.unsqueeze(0), seg_b1.unsqueeze(0),
             )
             edge_penalties.append(F.softplus(node_margin - clearance).mean())
 
@@ -471,10 +465,8 @@ def compute_geometry_prior_regularizer(pred_geo, base_data, action_topo, cfg, no
     return torch.stack(penalties).mean() if penalties else pred_geo.new_tensor(0.0)
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# 鎵归噺楠岃瘉锛堟棤姊害锛?
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 def eval_il_epoch(policy, curve_encoder, dataloader, device, cfg):
+    """在验证集上评估一个 IL epoch，返回平均验证损失（先验路径）。"""
     policy.eval()
     curve_encoder.eval()
     total_loss = 0.0
@@ -494,6 +486,7 @@ def eval_il_epoch(policy, curve_encoder, dataloader, device, cfg):
             cond = _build_geo_conditions(x_enc, action_topo, z_c, base_data=base_data)
             geo_post_pred, geo_mu, geo_logvar = policy.geo_head(action_geo, cond)
             geo_prior_pred = policy.geo_head.prior_mean(cond)
+
             geo_reg_post = compute_geometry_prior_regularizer(
                 geo_post_pred, base_data, action_topo, cfg,
             )
@@ -515,12 +508,9 @@ def eval_il_epoch(policy, curve_encoder, dataloader, device, cfg):
 
 
 
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-# 鎵归噺璁粌锛堝叏鍚戦噺鍖栵紝鏃?Python sample loop锛?
-# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 def train_il_epoch(policy, curve_encoder, optimizer, dataloader, device, cfg,
                    all_params=None):
-    """Train one IL epoch using both posterior reconstruction and prior regularization."""
+    """训练一个 IL epoch，使用后验重建 + 先验正则化组合损失。"""
     policy.train()
     curve_encoder.train()
     total_loss = 0.0
@@ -543,6 +533,7 @@ def train_il_epoch(policy, curve_encoder, optimizer, dataloader, device, cfg,
         cond = _build_geo_conditions(x_enc, action_topo, z_c, base_data=base_data)
         geo_post_pred, geo_mu, geo_logvar = policy.geo_head(action_geo, cond)
         geo_prior_pred = policy.geo_head.prior_mean(cond)
+
         geo_reg_post = compute_geometry_prior_regularizer(
             geo_post_pred, base_data, action_topo, cfg,
         )
@@ -566,4 +557,3 @@ def train_il_epoch(policy, curve_encoder, optimizer, dataloader, device, cfg,
         total_loss += metrics['total'].item()
 
     return total_loss / max(len(dataloader), 1)
-

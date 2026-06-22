@@ -67,15 +67,18 @@ LINKS4Meta/
 |  `- run_generate_80k_v2.py
 |
 |- GraphMetaMat-LINKS/
-|  |- code/
-|  |  |- dataset_tool.py
-|  |  |- train_forward_bio.py
-|  |  |- pretrain_inverse_bio.py
-|  |  |- build_family_index.py
-|  |  |- train_inverse_bio.py
-|  |  |- rl_refine_bio.py
-|  |  |- run_experiment_bio.py
-|  |  `- inference_inverse.py
+|  |- scripts/                       # executable entrypoints by algorithm module
+|  |  |- data/
+|  |  |- forward/
+|  |  |- pretraining/
+|  |  |- family_index/
+|  |  |- inverse_il/
+|  |  |- inverse_rl/
+|  |  |- inference/
+|  |  |- diagnostics/
+|  |  |- benchmarks/
+|  |  `- reports/
+|  |- code/                          # compatibility wrappers for old commands
 |  |- src/
 |  |  |- inverse/                      # IL / RL / MCTS / pretrain modules
 |  |  |- generative_curve/             # forward surrogate model
@@ -84,7 +87,7 @@ LINKS4Meta/
 |  |  |- config_inverse.yaml
 |  |  |- pretrain_links.yaml
 |  |  `- train_links4meta_il.yaml
-|  `- tests/
+|  `- tests/                          # phase-oriented unit and regression tests
 |
 |- demo/
 |  |- outputs/                         # checkpoints, reports, family index, smoke outputs
@@ -155,6 +158,8 @@ F:\Anaconda\envs\GMM\python.exe
 ```
 
 In the examples below, `python` assumes the GMM environment is already activated.
+The canonical executable entrypoints live under `GraphMetaMat-LINKS/scripts/`;
+`GraphMetaMat-LINKS/code/` keeps thin compatibility wrappers for older commands.
 
 ## Main Data Artifacts
 
@@ -189,7 +194,7 @@ python LINKS-main/run_generate_80k_v2.py
 If needed, convert the `.pkl` dataset into the `.pt` format used by the forward pipeline:
 
 ```bash
-python GraphMetaMat-LINKS/code/dataset_tool.py ^
+python GraphMetaMat-LINKS/scripts/data/dataset_tool.py ^
   --input_pkl LINKS-main/output/data_gen_v2_final80k_20260331/diverse_dataset_v2.pkl ^
   convert ^
   --output_pt LINKS-main/output/data_gen_v2_final80k_20260331/diverse_dataset_v2_with_curves.pt
@@ -198,7 +203,7 @@ python GraphMetaMat-LINKS/code/dataset_tool.py ^
 ### 2. Train the forward surrogate
 
 ```bash
-python GraphMetaMat-LINKS/code/train_forward_bio.py ^
+python GraphMetaMat-LINKS/scripts/forward/train_forward_bio.py ^
   --config_dataset GraphMetaMat-LINKS/src/config_dataset.yaml
 ```
 
@@ -207,7 +212,7 @@ python GraphMetaMat-LINKS/code/train_forward_bio.py ^
 This uses the dedicated pretraining config:
 
 ```bash
-python GraphMetaMat-LINKS/code/pretrain_inverse_bio.py ^
+python GraphMetaMat-LINKS/scripts/pretraining/pretrain_inverse_bio.py ^
   --config GraphMetaMat-LINKS/src/pretrain_links.yaml
 ```
 
@@ -223,7 +228,7 @@ This stage exports:
 This materializes the step-level family index, split file, and codebook JSON:
 
 ```bash
-python GraphMetaMat-LINKS/code/build_family_index.py ^
+python GraphMetaMat-LINKS/scripts/family_index/build_family_index.py ^
   --config GraphMetaMat-LINKS/src/train_links4meta_il.yaml ^
   --export-jsonl
 ```
@@ -231,7 +236,7 @@ python GraphMetaMat-LINKS/code/build_family_index.py ^
 ### 5. Train the inverse IL policy
 
 ```bash
-python GraphMetaMat-LINKS/code/train_inverse_bio.py ^
+python GraphMetaMat-LINKS/scripts/inverse_il/train_inverse_bio.py ^
   --config GraphMetaMat-LINKS/src/train_links4meta_il.yaml
 ```
 
@@ -245,21 +250,21 @@ The IL entrypoint will:
 ### 6. Run RL refinement
 
 ```bash
-python GraphMetaMat-LINKS/code/rl_refine_bio.py ^
+python GraphMetaMat-LINKS/scripts/inverse_rl/rl_refine_bio.py ^
   --config GraphMetaMat-LINKS/src/config_inverse.yaml
 ```
 
 ### 7. Run experiment comparison
 
 ```bash
-python GraphMetaMat-LINKS/code/run_experiment_bio.py ^
+python GraphMetaMat-LINKS/scripts/benchmarks/run_experiment_bio.py ^
   --config GraphMetaMat-LINKS/src/config_inverse.yaml
 ```
 
 ### 8. Run inverse inference
 
 ```bash
-python GraphMetaMat-LINKS/code/inference_inverse.py ^
+python GraphMetaMat-LINKS/scripts/inference/inference_inverse.py ^
   --config GraphMetaMat-LINKS/src/config_inverse.yaml ^
   --model_type rl
 ```
@@ -288,9 +293,9 @@ Unit and regression tests live under:
 Examples:
 
 ```bash
-python -m unittest GraphMetaMat-LINKS/tests/test_phase4_il.py
-python -m unittest GraphMetaMat-LINKS/tests/test_links_pretrain.py
-python -m unittest GraphMetaMat-LINKS/tests/test_family_index_builder.py
+python -m unittest GraphMetaMat-LINKS/tests/phase4_il/test_il.py
+python -m unittest GraphMetaMat-LINKS/tests/pretraining/test_links_pretrain.py
+python -m unittest GraphMetaMat-LINKS/tests/family_index/test_family_index_builder.py
 ```
 
 ## Current Status

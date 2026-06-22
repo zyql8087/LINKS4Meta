@@ -2,10 +2,11 @@
 
 Date: 2026-06-03
 
-This document is a review-only organization proposal. It does not imply that any
-code has already been moved. The goal is to classify the current LINKS4Meta code
-by algorithm framework modules, then define a safer target layout for a later
-cleanup pass.
+This document began as a review-only organization proposal. The first cleanup
+pass has now been applied: executable entrypoints were moved from `code/` to
+algorithm-oriented `scripts/` folders, `code/` now contains compatibility
+wrappers, and tests were moved into phase-oriented folders. Importable `src/`
+module migration remains future work.
 
 ## Scope
 
@@ -15,7 +16,8 @@ The workspace currently contains several code-bearing roots:
   kinematics checks, and raw dataset export.
 - `GraphMetaMat-LINKS/`: the active Git repository for GraphMetaMat-style forward
   and inverse learning.
-- `GraphMetaMat-LINKS/code/`: executable entrypoints and experiment scripts.
+- `GraphMetaMat-LINKS/scripts/`: executable entrypoints and experiment scripts.
+- `GraphMetaMat-LINKS/code/`: compatibility wrappers for old entrypoint paths.
 - `GraphMetaMat-LINKS/src/`: importable training, model, data, inverse-design,
   and utility modules.
 - `GraphMetaMat-LINKS/tests/`: phase-oriented unit and regression tests.
@@ -119,9 +121,9 @@ GraphMetaMat-LINKS/
 |  `- integration/
 ```
 
-For a first cleanup pass, the package can keep the current `src/` namespace and
-only reorganize `code/` into `scripts/` subfolders. A deeper pass can later rename
-`src` imports to `src.links4meta.*` or an installed package name.
+The first cleanup pass keeps the current `src/` namespace and reorganizes
+entrypoints into `scripts/` subfolders. A deeper pass can later rename `src`
+imports to `src.links4meta.*` or an installed package name.
 
 ## Current file classification
 
@@ -142,7 +144,7 @@ Current files:
 - `LINKS-main/data_gen_v2/diversity_sampler.py`
 - `LINKS-main/run_generate_80k_v2.py`
 - `demo/run_phase0_phase1_pipeline.py`
-- `GraphMetaMat-LINKS/tests/test_phase0_phase1_pipeline.py`
+- `GraphMetaMat-LINKS/tests/phase0_phase1_generation/test_pipeline.py`
 
 Suggested target:
 
@@ -167,8 +169,9 @@ Current files:
 - `GraphMetaMat-LINKS/src/data_load.py`
 - `GraphMetaMat-LINKS/src/forward_dataset_utils.py`
 - `GraphMetaMat-LINKS/src/config_dataset.yaml`
-- `GraphMetaMat-LINKS/code/dataset_tool.py`
-- `GraphMetaMat-LINKS/tests/test_phase2_split.py`
+- `GraphMetaMat-LINKS/scripts/data/dataset_tool.py`
+- `GraphMetaMat-LINKS/code/dataset_tool.py` compatibility wrapper
+- `GraphMetaMat-LINKS/tests/phase2_split/test_family_split.py`
 
 Suggested target:
 
@@ -192,12 +195,13 @@ Current files:
 - `GraphMetaMat-LINKS/src/generative_curve/GNN_train_biokinematics.py`
 - `GraphMetaMat-LINKS/src/forward_metrics.py`
 - `GraphMetaMat-LINKS/src/config_model_bio.yaml`
-- `GraphMetaMat-LINKS/code/train_forward_bio.py`
-- `GraphMetaMat-LINKS/code/evaluate_forward_bio.py`
-- `GraphMetaMat-LINKS/code/test_forward_bio.py`
-- `GraphMetaMat-LINKS/code/run_surrogate_ranking_quality.py`
+- `GraphMetaMat-LINKS/scripts/forward/train_forward_bio.py`
+- `GraphMetaMat-LINKS/scripts/forward/evaluate_forward_bio.py`
+- `GraphMetaMat-LINKS/scripts/forward/test_forward_bio.py`
+- `GraphMetaMat-LINKS/scripts/benchmarks/run_surrogate_ranking_quality.py`
+- `GraphMetaMat-LINKS/code/*.py` compatibility wrappers for these entrypoints
 - `demo/run_phase3_forward_suite.py`
-- `GraphMetaMat-LINKS/tests/test_phase3_forward.py`
+- `GraphMetaMat-LINKS/tests/phase3_forward/test_forward.py`
 
 Suggested target:
 
@@ -226,7 +230,7 @@ Current files:
 - `GraphMetaMat-LINKS/src/layers_pooler.py`
 - `GraphMetaMat-LINKS/src/kinematics_extract.py`
 - `GraphMetaMat-LINKS/src/__init__.py`
-- `GraphMetaMat-LINKS/tests/test_kinematics.py`
+- `GraphMetaMat-LINKS/tests/common/test_kinematics.py`
 
 Suggested target:
 
@@ -249,8 +253,9 @@ Current files:
 - `GraphMetaMat-LINKS/src/inverse/pretrain_links.py`
 - `GraphMetaMat-LINKS/src/inverse/curve_encoder.py`
 - `GraphMetaMat-LINKS/src/pretrain_links.yaml`
-- `GraphMetaMat-LINKS/code/pretrain_inverse_bio.py`
-- `GraphMetaMat-LINKS/tests/test_links_pretrain.py`
+- `GraphMetaMat-LINKS/scripts/pretraining/pretrain_inverse_bio.py`
+- `GraphMetaMat-LINKS/code/pretrain_inverse_bio.py` compatibility wrapper
+- `GraphMetaMat-LINKS/tests/pretraining/test_links_pretrain.py`
 
 Suggested target:
 
@@ -269,9 +274,10 @@ Current files:
 
 - `GraphMetaMat-LINKS/src/inverse/action_codebook.py`
 - `GraphMetaMat-LINKS/src/inverse/family_index_builder.py`
-- `GraphMetaMat-LINKS/code/build_family_index.py`
-- `GraphMetaMat-LINKS/code/rebuild_il_codebook.py`
-- `GraphMetaMat-LINKS/tests/test_family_index_builder.py`
+- `GraphMetaMat-LINKS/scripts/family_index/build_family_index.py`
+- `GraphMetaMat-LINKS/scripts/family_index/rebuild_il_codebook.py`
+- `GraphMetaMat-LINKS/code/*.py` compatibility wrappers for these entrypoints
+- `GraphMetaMat-LINKS/tests/family_index/test_family_index_builder.py`
 
 Suggested target:
 
@@ -296,12 +302,13 @@ Current files:
 - `GraphMetaMat-LINKS/src/inverse/train_il.py`
 - `GraphMetaMat-LINKS/src/inverse/gnn_policy.py`
 - `GraphMetaMat-LINKS/src/train_links4meta_il.yaml`
-- `GraphMetaMat-LINKS/code/train_inverse_bio.py`
-- `GraphMetaMat-LINKS/code/run_il_diagnostics.py`
-- `GraphMetaMat-LINKS/code/run_il_geometry_validity_diagnostics.py`
-- `GraphMetaMat-LINKS/code/run_il_oracle_coverage_diagnostics.py`
-- `GraphMetaMat-LINKS/tests/test_phase4_il.py`
-- `GraphMetaMat-LINKS/tests/test_high_priority_fixes.py`
+- `GraphMetaMat-LINKS/scripts/inverse_il/train_inverse_bio.py`
+- `GraphMetaMat-LINKS/scripts/diagnostics/run_il_diagnostics.py`
+- `GraphMetaMat-LINKS/scripts/diagnostics/run_il_geometry_validity_diagnostics.py`
+- `GraphMetaMat-LINKS/scripts/diagnostics/run_il_oracle_coverage_diagnostics.py`
+- `GraphMetaMat-LINKS/code/*.py` compatibility wrappers for these entrypoints
+- `GraphMetaMat-LINKS/tests/phase4_il/test_il.py`
+- `GraphMetaMat-LINKS/tests/regression/test_high_priority_fixes.py`
 
 Suggested target:
 
@@ -332,8 +339,9 @@ Current files:
 - `GraphMetaMat-LINKS/src/inverse/rl_env.py`
 - `GraphMetaMat-LINKS/src/inverse/rl_agent.py`
 - `GraphMetaMat-LINKS/src/config_inverse.yaml`
-- `GraphMetaMat-LINKS/code/rl_refine_bio.py`
-- `GraphMetaMat-LINKS/tests/test_phase5_rl.py`
+- `GraphMetaMat-LINKS/scripts/inverse_rl/rl_refine_bio.py`
+- `GraphMetaMat-LINKS/code/rl_refine_bio.py` compatibility wrapper
+- `GraphMetaMat-LINKS/tests/phase5_rl/test_rl.py`
 
 Suggested target:
 
@@ -355,8 +363,9 @@ Current files:
 
 - `GraphMetaMat-LINKS/src/inverse/mcts.py`
 - `GraphMetaMat-LINKS/src/inverse/inference_runtime.py`
-- `GraphMetaMat-LINKS/code/inference_inverse.py`
-- `GraphMetaMat-LINKS/tests/test_phase6_mcts.py`
+- `GraphMetaMat-LINKS/scripts/inference/inference_inverse.py`
+- `GraphMetaMat-LINKS/code/inference_inverse.py` compatibility wrapper
+- `GraphMetaMat-LINKS/tests/phase6_mcts/test_mcts.py`
 
 Suggested target:
 
@@ -374,10 +383,11 @@ Notes:
 Current files:
 
 - `GraphMetaMat-LINKS/src/inverse/readout_assignment.py`
-- `GraphMetaMat-LINKS/code/run_readout_assignment_demo.py`
-- `GraphMetaMat-LINKS/code/run_real_readout_benchmark.py`
-- `GraphMetaMat-LINKS/code/run_phase5_readout_diagnostics.py`
-- `GraphMetaMat-LINKS/tests/test_readout_assignment.py`
+- `GraphMetaMat-LINKS/scripts/benchmarks/run_readout_assignment_demo.py`
+- `GraphMetaMat-LINKS/scripts/benchmarks/run_real_readout_benchmark.py`
+- `GraphMetaMat-LINKS/scripts/diagnostics/run_phase5_readout_diagnostics.py`
+- `GraphMetaMat-LINKS/code/*.py` compatibility wrappers for these entrypoints
+- `GraphMetaMat-LINKS/tests/readout/test_readout_assignment.py`
 
 Suggested target:
 
@@ -397,9 +407,10 @@ Notes:
 Current files:
 
 - `GraphMetaMat-LINKS/src/inverse/experiment_utils.py`
-- `GraphMetaMat-LINKS/code/run_experiment_bio.py`
-- `GraphMetaMat-LINKS/code/gen_experiment_report.py`
-- `GraphMetaMat-LINKS/tests/test_experiment_pipeline.py`
+- `GraphMetaMat-LINKS/scripts/benchmarks/run_experiment_bio.py`
+- `GraphMetaMat-LINKS/scripts/reports/gen_experiment_report.py`
+- `GraphMetaMat-LINKS/code/*.py` compatibility wrappers for these entrypoints
+- `GraphMetaMat-LINKS/tests/integration/test_experiment_pipeline.py`
 
 Suggested target:
 
@@ -418,40 +429,28 @@ Notes:
 
 ## Test classification
 
-Suggested future test folders:
+Current test folders:
 
 - `tests/phase0_phase1_generation/test_pipeline.py`
-  - from `tests/test_phase0_phase1_pipeline.py`
 - `tests/phase2_split/test_family_split.py`
-  - from `tests/test_phase2_split.py`
 - `tests/phase3_forward/test_forward.py`
-  - from `tests/test_phase3_forward.py`
 - `tests/pretraining/test_links_pretrain.py`
-  - from `tests/test_links_pretrain.py`
 - `tests/family_index/test_family_index_builder.py`
-  - from `tests/test_family_index_builder.py`
 - `tests/phase4_il/test_il.py`
-  - from `tests/test_phase4_il.py`
 - `tests/phase5_rl/test_rl.py`
-  - from `tests/test_phase5_rl.py`
 - `tests/phase6_mcts/test_mcts.py`
-  - from `tests/test_phase6_mcts.py`
 - `tests/readout/test_readout_assignment.py`
-  - from `tests/test_readout_assignment.py`
 - `tests/common/test_kinematics.py`
-  - from `tests/test_kinematics.py`
 - `tests/integration/test_experiment_pipeline.py`
-  - from `tests/test_experiment_pipeline.py`
 - `tests/regression/test_high_priority_fixes.py`
-  - from `tests/test_high_priority_fixes.py`
 
 ## Recommended migration order
 
-1. Documentation-only pass.
+1. Documentation-only pass. Completed.
    - Keep this document and update README with a high-level map.
    - Do not move files.
 
-2. Script-only pass.
+2. Script-only pass. Completed.
    - Move `GraphMetaMat-LINKS/code/*.py` into `scripts/*`.
    - Add temporary wrapper files or update run commands and tests in the same
      commit.
@@ -481,6 +480,8 @@ Suggested future test folders:
 
 - Several tests import helpers directly from script files, especially
   `train_inverse_bio.py`, `run_experiment_bio.py`, and `dataset_tool.py`.
+  Compatibility wrappers under `code/` preserve those imports after script
+  relocation.
 - `src/inverse/phase4_il.py`, `src/inverse/rl_env.py`, and
   `src/inverse/readout_assignment.py` contain cross-phase helper functions.
 - `LINKS-main` is outside the active `GraphMetaMat-LINKS` Git repository. Moving
@@ -494,16 +495,16 @@ Suggested future test folders:
 
 After any actual movement, run at least:
 
-- `python -m unittest tests/test_phase0_phase1_pipeline.py`
-- `python -m unittest tests/test_phase2_split.py`
-- `python -m unittest tests/test_phase3_forward.py`
-- `python -m unittest tests/test_links_pretrain.py`
-- `python -m unittest tests/test_family_index_builder.py`
-- `python -m unittest tests/test_phase4_il.py`
-- `python -m unittest tests/test_phase5_rl.py`
-- `python -m unittest tests/test_phase6_mcts.py`
-- `python -m unittest tests/test_readout_assignment.py`
-- `python -m unittest tests/test_experiment_pipeline.py`
+- `python -m unittest tests/phase0_phase1_generation/test_pipeline.py`
+- `python -m unittest tests/phase2_split/test_family_split.py`
+- `python -m unittest tests/phase3_forward/test_forward.py`
+- `python -m unittest tests/pretraining/test_links_pretrain.py`
+- `python -m unittest tests/family_index/test_family_index_builder.py`
+- `python -m unittest tests/phase4_il/test_il.py`
+- `python -m unittest tests/phase5_rl/test_rl.py`
+- `python -m unittest tests/phase6_mcts/test_mcts.py`
+- `python -m unittest tests/readout/test_readout_assignment.py`
+- `python -m unittest tests/integration/test_experiment_pipeline.py`
 
 Also smoke-test the key entrypoints after script relocation:
 
@@ -518,11 +519,12 @@ Also smoke-test the key entrypoints after script relocation:
 
 ## Immediate recommendation
 
-For the next step, keep code files in place and review this classification. If the
-module boundaries look right, the lowest-risk implementation plan is:
+For the next source-package cleanup step, keep the compatibility wrappers in
+place and migrate importable `src/` modules in small batches. The lowest-risk
+implementation plan is:
 
-1. Reorganize `code/` into `scripts/` subfolders first.
-2. Add compatibility wrappers for any scripts imported by tests.
-3. Update README command examples.
-4. Run the phase tests.
-5. Only then start moving importable `src/` modules.
+1. Keep `code/` wrappers until all external commands have moved to `scripts/`.
+2. Move shared `src` infrastructure first.
+3. Move forward/data/pretraining modules next.
+4. Move inverse core modules last.
+5. Split large files only after package imports are stable.

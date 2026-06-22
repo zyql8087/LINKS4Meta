@@ -1,4 +1,8 @@
 # src/generative_curve/GNN_train_biokinematics.py
+"""
+生物运动学 GNN 的训练与评估：train_epoch 执行一个训练轮次，eval_epoch 在验证集上
+计算损失和多项评估指标（路径误差、Chamfer距离、NMAE等）。
+"""
 
 from __future__ import annotations
 
@@ -9,6 +13,7 @@ from src.forward_metrics import compute_forward_metrics_batch, compute_loss
 
 
 def train_epoch(model, loader, optimizer, config, device):
+    """执行一个训练轮次，返回平均损失值。"""
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -19,6 +24,7 @@ def train_epoch(model, loader, optimizer, config, device):
 
         pred_foot, pred_knee, pred_ankle = model(data)
         loss, _, _, _ = compute_loss(pred_foot, pred_knee, pred_ankle, data, config)
+
         loss.backward()
         optimizer.step()
 
@@ -29,9 +35,11 @@ def train_epoch(model, loader, optimizer, config, device):
 
 
 def eval_epoch(model, loader, config, device):
+    """执行一个评估轮次，返回 (平均损失, 各指标均值字典)。"""
     model.eval()
     total_loss = 0.0
     total_batches = 0
+
     metric_sums = {
         "foot_path_error": 0.0,
         "foot_chamfer": 0.0,
@@ -45,9 +53,10 @@ def eval_epoch(model, loader, config, device):
     with torch.no_grad():
         for data in tqdm(loader, desc="Evaluating", leave=False):
             data = data.to(device)
-            pred_foot, pred_knee, pred_ankle = model(data)
 
+            pred_foot, pred_knee, pred_ankle = model(data)
             loss, _, _, _ = compute_loss(pred_foot, pred_knee, pred_ankle, data, config)
+
             metrics = compute_forward_metrics_batch(
                 pred_foot,
                 pred_knee,

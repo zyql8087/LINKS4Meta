@@ -1,3 +1,4 @@
+"""族索引构建器。将逐步路径数据构建为结构化索引文件（pt/jsonl/json），用于后续查询和分析。"""
 from __future__ import annotations
 
 import json
@@ -14,6 +15,7 @@ from src.inverse.action_codebook import export_action_codebook_v1_json
 
 
 def _tensor_to_list(value):
+    """将 Tensor 转为 Python 列表，其他类型原样返回。"""
     if value is None:
         return None
     if isinstance(value, torch.Tensor):
@@ -22,6 +24,7 @@ def _tensor_to_list(value):
 
 
 def _graph_summary(graph: Data) -> dict[str, object]:
+    """生成图的可序列化摘要：节点数、无向边数、固定节点列表、节点坐标。"""
     edge_index = graph.edge_index.detach().cpu()
     num_edges = int(edge_index.size(1) // 2) if edge_index.numel() > 0 else 0
     fixed_nodes = []
@@ -36,19 +39,16 @@ def _graph_summary(graph: Data) -> dict[str, object]:
 
 
 def _motion_cluster(item: dict[str, object]) -> str:
+    """通过量化运动学统计特征生成聚类标识符。"""
     foot = np.asarray(item["y_foot"], dtype=np.float32)
     knee = np.asarray(item["y_knee"], dtype=np.float32).reshape(-1)
     ankle = np.asarray(item["y_ankle"], dtype=np.float32).reshape(-1)
     descriptor = np.asarray(
         [
-            float(foot[:, 0].mean()),
-            float(foot[:, 1].mean()),
-            float(foot[:, 0].std()),
-            float(foot[:, 1].std()),
-            float(knee.mean()),
-            float(knee.std()),
-            float(ankle.mean()),
-            float(ankle.std()),
+            float(foot[:, 0].mean()), float(foot[:, 1].mean()),
+            float(foot[:, 0].std()), float(foot[:, 1].std()),
+            float(knee.mean()), float(knee.std()),
+            float(ankle.mean()), float(ankle.std()),
         ],
         dtype=np.float32,
     )
@@ -57,6 +57,7 @@ def _motion_cluster(item: dict[str, object]) -> str:
 
 
 def _trace_group_meta(trace_steps: Sequence[dict[str, object]]) -> dict[str, object]:
+    """从同一轨迹的多个步骤中聚合元数据。"""
     first = trace_steps[0]
     geometry_ids = [int(step["action_code_id"]) for step in trace_steps]
     return {
@@ -71,6 +72,7 @@ def _trace_group_meta(trace_steps: Sequence[dict[str, object]]) -> dict[str, obj
 
 
 def _trace_id_to_split(split: dict[str, object], step_paths: Sequence[dict[str, object]]) -> dict[int, str]:
+    """构建 trace_id 到划分名称 (train/val/test) 的映射。"""
     mapping: dict[int, str] = {}
     for split_name in ("train_indices", "val_indices", "test_indices"):
         label = split_name.replace("_indices", "")
@@ -80,6 +82,7 @@ def _trace_id_to_split(split: dict[str, object], step_paths: Sequence[dict[str, 
 
 
 def _group_step_paths(step_paths: Sequence[dict[str, object]]) -> dict[int, list[dict[str, object]]]:
+    """按 trace_id 对步骤路径分组，并按 step_index 排序。"""
     grouped: dict[int, list[dict[str, object]]] = defaultdict(list)
     for item in step_paths:
         grouped[int(item["sample_id"])].append(item)
@@ -90,6 +93,7 @@ def _group_step_paths(step_paths: Sequence[dict[str, object]]) -> dict[int, list
 
 
 def _record_payload(item: dict[str, object], split_name: str) -> dict[str, object]:
+    """构建单条记录的完整序列化负载。"""
     return {
         "sample_id": int(item["sample_id"]),
         "trace_id": int(item["trace_id"]),
@@ -135,6 +139,7 @@ def build_family_index_artifacts(
     dataset_path: str | Path,
     export_jsonl: bool = True,
 ) -> dict[str, object]:
+    """构建族索引的所有产物文件（pt/jsonl/json/manifest），返回清单信息。"""
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -156,13 +161,7 @@ def build_family_index_artifacts(
         meta = _trace_group_meta(items)
         split_members[split_name].append(int(trace_id))
         family_counts[meta["family_id"]] += 1
-        trace_assignments.append(
-            {
-                "sample_id": int(trace_id),
-                "split": split_name,
-                **meta,
-            }
-        )
+        trace_assignments.append({"sample_id": int(trace_id), "split": split_name, **meta})
         group_meta[str(trace_id)] = meta
 
     serialized_records = []
@@ -199,6 +198,7 @@ def build_family_index_artifacts(
         "trace_assignments": trace_assignments,
     }
     split_json_path.write_text(json.dumps(split_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
     export_action_codebook_v1_json(dataset_path, codebook, step_paths=step_paths, output_path=codebook_json_path)
 
     manifest = {
@@ -214,6 +214,7 @@ def build_family_index_artifacts(
         },
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
     return {
         **manifest,
         "paths": manifest["paths"],

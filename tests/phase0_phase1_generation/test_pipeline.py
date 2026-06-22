@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 LINKS_ROOT = WORKSPACE_ROOT / "LINKS-main"
 if str(LINKS_ROOT) not in sys.path:
     sys.path.insert(0, str(LINKS_ROOT))

@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 LINKS_ROOT = WORKSPACE_ROOT / "LINKS-main"
 GMM_ROOT = WORKSPACE_ROOT / "GraphMetaMat-LINKS"
 for root in (LINKS_ROOT, GMM_ROOT):

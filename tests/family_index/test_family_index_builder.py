@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 GMM_ROOT = WORKSPACE_ROOT / "GraphMetaMat-LINKS"
 for root in (GMM_ROOT, GMM_ROOT / "code"):
     if str(root) not in sys.path:
@@ -120,7 +120,7 @@ class TestFamilyIndexBuilder(unittest.TestCase):
         self.assertEqual(manifest["num_step_records"], 3)
         self.assertEqual(split_payload["version"], "family_group_split_v1")
         self.assertIn("100", split_payload["group_meta"])
-        self.assertEqual(codebook_payload["version"], "geom_codebook_v1")
+        self.assertEqual(codebook_payload["version"], "geom_codebook_v2_validity_context_bucket")
         self.assertGreaterEqual(len(codebook_payload["codes"]), 1)
         self.assertIsInstance(first_record["labels"]["geom_code"], int)
         self.assertIn("valid_geom_mask", first_record["masks"])

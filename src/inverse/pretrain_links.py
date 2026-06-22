@@ -1,3 +1,5 @@
+"""LINKS 图对比预训练模块。通过对比学习将图结构编码器与运动曲线编码器映射到同一嵌入空间，
+并训练图有效性判别和前向曲线预测两个辅助任务。"""
 from __future__ import annotations
 
 import json
@@ -24,6 +26,7 @@ from src.kinematics_extract import extract_kinematics
 
 @dataclass
 class LinksPretrainBatch:
+    """预训练批次数据容器，聚合合法图、无效图和运动学曲线。"""
     valid_graphs: Batch
     invalid_graphs: Batch
     y_foot: torch.Tensor
@@ -33,6 +36,8 @@ class LinksPretrainBatch:
 
 
 class ProjectionHead(nn.Module):
+    """两层全连接投影头，输出 L2 归一化向量，用于对比学习。"""
+
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -46,6 +51,8 @@ class ProjectionHead(nn.Module):
 
 
 class ValidityHead(nn.Module):
+    """图有效性二分类头，输出单个 logit 值。"""
+
     def __init__(self, input_dim: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -59,6 +66,8 @@ class ValidityHead(nn.Module):
 
 
 class ForwardCurveHead(nn.Module):
+    """前向曲线预测头，从图特征预测运动学曲线。"""
+
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -72,6 +81,7 @@ class ForwardCurveHead(nn.Module):
 
 
 def _curve_targets(sample: dict[str, object]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """提取运动学曲线目标，优先使用预计算数据，否则实时提取。"""
     if all(key in sample for key in ("foot_curve", "knee_curve", "ankle_curve")):
         return (
             np.asarray(sample["foot_curve"], dtype=np.float32),
@@ -82,6 +92,7 @@ def _curve_targets(sample: dict[str, object]) -> tuple[np.ndarray, np.ndarray, n
 
 
 def sample_to_pretrain_graph(sample: dict[str, object]) -> Data:
+    """将原始样本转换为 PyG 图数据。节点特征：[坐标(2), is_fixed(1), is_grounded(1)]。"""
     A = np.asarray(sample["A"])
     x0 = np.asarray(sample["x0"], dtype=np.float32)
     types = np.asarray(sample["types"])
@@ -90,8 +101,8 @@ def sample_to_pretrain_graph(sample: dict[str, object]) -> Data:
     is_grounded = np.zeros_like(is_fixed, dtype=np.float32)
     if is_grounded.size > 0:
         is_grounded[0] = 1.0
-    x_features = np.column_stack([x0, is_fixed, is_grounded])
 
+    x_features = np.column_stack([x0, is_fixed, is_grounded])
     rows, cols = np.where(A)
     graph = Data(
         x=torch.tensor(x_features, dtype=torch.float32),
@@ -103,6 +114,7 @@ def sample_to_pretrain_graph(sample: dict[str, object]) -> Data:
 
 
 def _synthesize_invalid_graph(graph: Data, rng: random.Random) -> Data:
+    """合成无效图：将一个节点坐标复制到另一节点位置，制造几何重叠。"""
     invalid = Data(
         x=graph.x.clone(),
         pos=graph.pos.clone(),
@@ -112,6 +124,7 @@ def _synthesize_invalid_graph(graph: Data, rng: random.Random) -> Data:
     if num_nodes < 2:
         return invalid
 
+    # 优先选择移动节点作为源
     moving_nodes = [idx for idx in range(num_nodes) if float(invalid.x[idx, 2].item()) < 0.5]
     source_candidates = moving_nodes if moving_nodes else list(range(1, num_nodes))
     source_idx = source_candidates[rng.randrange(len(source_candidates))]
@@ -125,6 +138,7 @@ def _synthesize_invalid_graph(graph: Data, rng: random.Random) -> Data:
 
 
 def _load_split_artifact(split_path: str) -> dict[str, object]:
+    """加载数据集划分文件，支持 JSON 和 pt 格式。"""
     path = Path(split_path)
     if path.suffix.lower() == ".json":
         with path.open("r", encoding="utf-8") as handle:
@@ -133,6 +147,7 @@ def _load_split_artifact(split_path: str) -> dict[str, object]:
 
 
 def _map_split_indices(samples: Sequence[dict[str, object]], split_path: str | None) -> dict[str, list[int]]:
+    """映射划分索引到当前样本列表。无划分文件时按 80/10/10 随机划分。"""
     if split_path and os.path.exists(split_path):
         raw_split = _canonical_split_indices(_load_split_artifact(split_path))
         sample_id_to_local = {
@@ -161,6 +176,7 @@ def _map_split_indices(samples: Sequence[dict[str, object]], split_path: str | N
 
 
 def _family_subset_indices(samples: Sequence[dict[str, object]], indices: Sequence[int], max_samples: int, seed: int) -> list[int]:
+    """按族分层子采样，确保每个族至少 1 个样本。"""
     if max_samples <= 0 or len(indices) <= max_samples:
         return list(indices)
 
@@ -171,13 +187,16 @@ def _family_subset_indices(samples: Sequence[dict[str, object]], indices: Sequen
 
     rng = random.Random(seed)
     budgets = {family: 0 for family in family_to_indices}
-    ordered_families = sorted(family_to_indices.keys())
+    ordered_families = sorted(family_to_indices)
     remaining = max_samples
+
+    # 第一轮：确保每个族至少 1 个样本
     if remaining >= len(ordered_families):
         for family in ordered_families:
             budgets[family] = 1
             remaining -= 1
 
+    # 第二轮：按比例分配剩余配额
     total = max(1, len(indices))
     remainders: list[tuple[float, str]] = []
     for family in ordered_families:
@@ -186,6 +205,7 @@ def _family_subset_indices(samples: Sequence[dict[str, object]], indices: Sequen
         budgets[family] += extra
         remainders.append((exact - extra, family))
 
+    # 第三轮：将剩余配额分配给余数最大的族
     assigned = sum(budgets.values())
     for _, family in sorted(remainders, reverse=True):
         if assigned >= max_samples:
@@ -211,6 +231,7 @@ def build_links_pretrain_records(
     seed: int = 42,
     constraint_cfg: dict | None = None,
 ) -> dict[str, object]:
+    """构建预训练数据记录，包含合法图、无效图和运动学曲线，以及划分索引。"""
     split = _map_split_indices(samples, split_path)
     selected = {
         split_name: _family_subset_indices(samples, indices, max_samples, seed)
@@ -226,9 +247,11 @@ def build_links_pretrain_records(
             sample = samples[global_idx]
             valid_graph = sample_to_pretrain_graph(sample)
             invalid_graph = _synthesize_invalid_graph(valid_graph, rng)
+
             is_invalid_valid, _ = validate_graph_structure(invalid_graph, constraint_cfg)
             if is_invalid_valid:
                 continue
+
             y_foot, y_knee, y_ankle = _curve_targets(sample)
             record = {
                 "sample_id": int(sample.get("id", global_idx)),
@@ -260,6 +283,7 @@ def ensure_links_pretrain_cache(
     constraint_cfg: dict | None = None,
     use_cached: bool = True,
 ) -> dict[str, object]:
+    """确保预训练缓存可用。缓存存在则加载，否则重新构建并保存。"""
     if use_cached and os.path.exists(cache_path):
         return torch.load(cache_path, map_location="cpu", weights_only=False)
 
@@ -278,6 +302,7 @@ def ensure_links_pretrain_cache(
 
 
 def subset_by_indices(items: Sequence, indices: Sequence[int]) -> list:
+    """按索引提取子集。"""
     return [items[int(idx)] for idx in indices]
 
 
@@ -288,6 +313,7 @@ def make_links_pretrain_batches(
     device,
     shuffle: bool,
 ) -> list[LinksPretrainBatch]:
+    """将预训练记录组织为批次数据，图数据通过 PyG Batch 合并。"""
     indices = list(range(len(records)))
     if shuffle:
         random.shuffle(indices)
@@ -324,6 +350,7 @@ def make_links_pretrain_batches(
 
 
 def contrastive_loss(graph_proj: torch.Tensor, curve_proj: torch.Tensor, temperature: float) -> tuple[torch.Tensor, float]:
+    """计算对称 InfoNCE 对比损失，返回损失值和 Top-1 检索准确率。"""
     logits = graph_proj @ curve_proj.t() / max(float(temperature), 1.0e-6)
     targets = torch.arange(logits.size(0), device=logits.device)
     loss_g2c = F.cross_entropy(logits, targets)
@@ -333,6 +360,7 @@ def contrastive_loss(graph_proj: torch.Tensor, curve_proj: torch.Tensor, tempera
 
 
 def _average_dict(metric_sums: dict[str, float], denom: int) -> dict[str, float]:
+    """将指标累加字典转换为平均值字典。"""
     denom = max(1, int(denom))
     return {key: value / denom for key, value in metric_sums.items()}
 
@@ -347,35 +375,30 @@ def run_links_pretraining(
     output_model_path: str,
     output_report_path: str,
 ) -> dict[str, object]:
+    """执行 LINKS 预训练，包含对比学习、有效性判别和前向预测三个任务。使用早停策略。"""
     pretrain_cfg = cfg.get("links_pretrain", {})
+
     train_records = subset_by_indices(cache["records"], cache["split"]["train_indices"])
     val_records = subset_by_indices(cache["records"], cache["split"]["val_indices"])
     test_records = subset_by_indices(cache["records"], cache["split"]["test_indices"])
 
     train_batches = make_links_pretrain_batches(
-        train_records,
-        batch_size=int(pretrain_cfg.get("batch_size", 256)),
-        device=device,
-        shuffle=True,
+        train_records, batch_size=int(pretrain_cfg.get("batch_size", 256)), device=device, shuffle=True,
     )
     val_batches = make_links_pretrain_batches(
-        val_records,
-        batch_size=int(pretrain_cfg.get("batch_size", 256)),
-        device=device,
-        shuffle=False,
+        val_records, batch_size=int(pretrain_cfg.get("batch_size", 256)), device=device, shuffle=False,
     )
     test_batches = make_links_pretrain_batches(
-        test_records,
-        batch_size=int(pretrain_cfg.get("batch_size", 256)),
-        device=device,
-        shuffle=False,
+        test_records, batch_size=int(pretrain_cfg.get("batch_size", 256)), device=device, shuffle=False,
     )
 
     hidden_dim = int(cfg.get("gnn_policy", {}).get("hidden_dim", 128))
     latent_dim = int(cfg.get("curve_encoder", {}).get("latent_dim", 128))
     projection_dim = int(pretrain_cfg.get("projection_dim", latent_dim))
+
     sample_batch = train_batches[0] if train_batches else (val_batches[0] if val_batches else test_batches[0])
     output_dim = int(sample_batch.curve_targets.size(1))
+
     graph_projection = ProjectionHead(hidden_dim, projection_dim).to(device)
     curve_projection = ProjectionHead(latent_dim, projection_dim).to(device)
     validity_head = ValidityHead(hidden_dim).to(device)
@@ -391,8 +414,7 @@ def run_links_pretraining(
         lr=float(pretrain_cfg.get("learning_rate", 3e-4)),
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(1, int(pretrain_cfg.get("epochs", 20))),
+        optimizer, T_max=max(1, int(pretrain_cfg.get("epochs", 20))),
     )
 
     contrastive_weight = float(pretrain_cfg.get("contrastive_weight", 1.0))
@@ -402,29 +424,18 @@ def run_links_pretraining(
     patience = int(pretrain_cfg.get("patience", 5))
 
     def eval_batches(batches: Sequence[LinksPretrainBatch]) -> dict[str, float]:
+        """在给定批次上评估所有指标。"""
         if not batches:
-            return {
-                "loss_total": 0.0,
-                "loss_contrastive": 0.0,
-                "loss_validity": 0.0,
-                "loss_forward": 0.0,
-                "retrieval_top1": 0.0,
-                "validity_accuracy": 0.0,
-            }
+            return {"loss_total": 0.0, "loss_contrastive": 0.0, "loss_validity": 0.0,
+                    "loss_forward": 0.0, "retrieval_top1": 0.0, "validity_accuracy": 0.0}
         policy.eval()
         curve_encoder.eval()
         graph_projection.eval()
         curve_projection.eval()
         validity_head.eval()
         forward_head.eval()
-        metric_sums = {
-            "loss_total": 0.0,
-            "loss_contrastive": 0.0,
-            "loss_validity": 0.0,
-            "loss_forward": 0.0,
-            "retrieval_top1": 0.0,
-            "validity_accuracy": 0.0,
-        }
+        metric_sums = {"loss_total": 0.0, "loss_contrastive": 0.0, "loss_validity": 0.0,
+                        "loss_forward": 0.0, "retrieval_top1": 0.0, "validity_accuracy": 0.0}
         with torch.no_grad():
             for batch in batches:
                 x_valid = policy.encode_graph(batch.valid_graphs)
@@ -438,25 +449,18 @@ def run_links_pretraining(
                 invalid_feat = scatter(x_invalid, batch.invalid_graphs.batch, dim=0, reduce="mean")
                 valid_logits = validity_head(graph_feat)
                 invalid_logits = validity_head(invalid_feat)
-                labels = torch.cat(
-                    [
-                        torch.ones_like(valid_logits),
-                        torch.zeros_like(invalid_logits),
-                    ],
-                    dim=0,
-                )
+                labels = torch.cat([torch.ones_like(valid_logits), torch.zeros_like(invalid_logits)], dim=0)
                 logits = torch.cat([valid_logits, invalid_logits], dim=0)
                 loss_validity = F.binary_cross_entropy_with_logits(logits, labels)
                 preds = (torch.sigmoid(logits) >= 0.5).float()
                 validity_acc = float((preds == labels).float().mean().item())
+
                 pred_curves = forward_head(graph_feat)
                 loss_forward = F.smooth_l1_loss(pred_curves, batch.curve_targets)
 
-                loss_total = (
-                    contrastive_weight * loss_contrastive
-                    + validity_weight * loss_validity
-                    + forward_weight * loss_forward
-                )
+                loss_total = (contrastive_weight * loss_contrastive
+                              + validity_weight * loss_validity
+                              + forward_weight * loss_forward)
                 metric_sums["loss_total"] += float(loss_total.item())
                 metric_sums["loss_contrastive"] += float(loss_contrastive.item())
                 metric_sums["loss_validity"] += float(loss_validity.item())
@@ -465,13 +469,8 @@ def run_links_pretraining(
                 metric_sums["validity_accuracy"] += validity_acc
         return _average_dict(metric_sums, len(batches))
 
-    history = {
-        "train_loss_total": [],
-        "val_loss_total": [],
-        "val_retrieval_top1": [],
-        "val_validity_accuracy": [],
-        "val_loss_forward": [],
-    }
+    history = {"train_loss_total": [], "val_loss_total": [], "val_retrieval_top1": [],
+               "val_validity_accuracy": [], "val_loss_forward": []}
     best_val = math.inf
     best_state = None
     patience_counter = 0
@@ -483,16 +482,11 @@ def run_links_pretraining(
         curve_projection.train()
         validity_head.train()
         forward_head.train()
-        metric_sums = {
-            "loss_total": 0.0,
-            "loss_contrastive": 0.0,
-            "loss_validity": 0.0,
-            "loss_forward": 0.0,
-            "retrieval_top1": 0.0,
-            "validity_accuracy": 0.0,
-        }
+        metric_sums = {"loss_total": 0.0, "loss_contrastive": 0.0, "loss_validity": 0.0,
+                        "loss_forward": 0.0, "retrieval_top1": 0.0, "validity_accuracy": 0.0}
         for batch in train_batches:
             optimizer.zero_grad(set_to_none=True)
+
             x_valid = policy.encode_graph(batch.valid_graphs)
             graph_feat = scatter(x_valid, batch.valid_graphs.batch, dim=0, reduce="mean")
             curve_feat = curve_encoder(batch.y_foot, batch.y_knee, batch.y_ankle)
@@ -504,22 +498,18 @@ def run_links_pretraining(
             invalid_feat = scatter(x_invalid, batch.invalid_graphs.batch, dim=0, reduce="mean")
             valid_logits = validity_head(graph_feat)
             invalid_logits = validity_head(invalid_feat)
-            labels = torch.cat(
-                [torch.ones_like(valid_logits), torch.zeros_like(invalid_logits)],
-                dim=0,
-            )
+            labels = torch.cat([torch.ones_like(valid_logits), torch.zeros_like(invalid_logits)], dim=0)
             logits = torch.cat([valid_logits, invalid_logits], dim=0)
             loss_validity = F.binary_cross_entropy_with_logits(logits, labels)
             preds = (torch.sigmoid(logits) >= 0.5).float()
             validity_acc = float((preds == labels).float().mean().item())
+
             pred_curves = forward_head(graph_feat)
             loss_forward = F.smooth_l1_loss(pred_curves, batch.curve_targets)
 
-            loss_total = (
-                contrastive_weight * loss_contrastive
-                + validity_weight * loss_validity
-                + forward_weight * loss_forward
-            )
+            loss_total = (contrastive_weight * loss_contrastive
+                          + validity_weight * loss_validity
+                          + forward_weight * loss_forward)
             loss_total.backward()
             torch.nn.utils.clip_grad_norm_(
                 list(policy.gnn.parameters())
@@ -572,12 +562,9 @@ def run_links_pretraining(
     _load_matching_state(curve_encoder, best_state["curve_encoder"])
 
     test_metrics = eval_batches(test_batches if test_batches else val_batches if val_batches else train_batches)
+
     payload = {
-        "policy_encoder": {
-            key: value
-            for key, value in best_state["policy"].items()
-            if key.startswith("gnn.")
-        },
+        "policy_encoder": {key: value for key, value in best_state["policy"].items() if key.startswith("gnn.")},
         "curve_encoder": best_state["curve_encoder"],
         "graph_projection": best_state["graph_projection"],
         "curve_projection": best_state["curve_projection"],
@@ -606,6 +593,7 @@ def run_links_pretraining(
     torch.save(payload["policy_encoder"], graph_encoder_path)
     torch.save(payload["forward_backbone"], forward_backbone_path)
     torch.save(payload["validity_head"], validity_head_path)
+
     ensure_parent_dir(output_report_path)
     payload["report"]["artifacts"] = {
         "graph_encoder": str(graph_encoder_path),
@@ -619,6 +607,7 @@ def run_links_pretraining(
 
 
 def _load_matching_state(module: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    """安全加载匹配的模型状态字典，只加载键名和形状都匹配的参数。"""
     current_state = module.state_dict()
     compatible = {
         key: value
@@ -629,6 +618,7 @@ def _load_matching_state(module: nn.Module, state_dict: dict[str, torch.Tensor])
 
 
 def load_links_pretrained_weights(policy, curve_encoder, ckpt_path: str, device) -> dict[str, object]:
+    """从检查点加载图编码器和曲线编码器的预训练权重。"""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     _load_matching_state(policy, ckpt.get("policy_encoder", ckpt.get("policy", {})))
     _load_matching_state(curve_encoder, ckpt["curve_encoder"])

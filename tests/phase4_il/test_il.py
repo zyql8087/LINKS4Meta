@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from torch_geometric.data import Batch
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 GMM_ROOT = WORKSPACE_ROOT / "GraphMetaMat-LINKS"
 for root in (GMM_ROOT, GMM_ROOT / "code"):
     if str(root) not in sys.path:
