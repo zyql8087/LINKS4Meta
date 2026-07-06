@@ -1,0 +1,143 @@
+# 合并实验: 新架构(z_c 条件注入: conv 曲线编码器 + FiLM) + v8 oracle/codebook 线。
+# 目标: 把新架构的"条件利用"能力与 v8 的 oracle-aware 几何码监督 + validity-best codebook 合并，
+#       专攻 9bar 几何码合法性(autoregressive 仍弱的唯一环节)。
+#
+# 关键设计:
+#   - 模型侧 = 新架构: curve_encoder 用 conv 友好的 [64,128]（与已验证的 _config_newarch_full 一致），
+#     FiLM/LayerNorm 条件注入在 gnn_policy.py / curve_encoder.py 代码里，二者共用。
+#   - 监督侧 = v8 fineaux oracle: oracle_code_loss + v2 validity-context-bucket 细分桶 codebook
+#     + 9bar bucket 扩容 override（复用 il_v8/data/...fineaux_seed23.pt 已构建数据集，--skip_extract）。
+#   - checkpoint/report 写新路径(merge_newarch)，不覆盖 newarch 或任何 v8 产物。
+curve_encoder:
+  input_dim: 800
+  hidden_dims: [64, 128]
+  latent_dim: 128
+
+gnn_policy:
+  node_input_dim: 4
+  edge_input_dim: 1
+  hidden_dim: 128
+  num_layers: 4
+  dropout: 0.1
+  num_families: 4
+  family_embedding_dim: 8
+  step_embedding_dim: 8
+  context_hidden_dim: 128
+  max_step_count: 2
+
+cvae:
+  latent_dim: 64
+  condition_dim: 128
+  output_dim: 4
+  beta: 1.0
+  prior_bias_init: 0.10
+  prior_bias_max: 0.50
+
+# 与 fineaux 数据集烘焙时一致的 v2 codebook 定义（--skip_extract 时主要用于 oracle 候选枚举参数）
+action_codebook:
+  version: geom_codebook_v2_validity_context_bucket
+  cluster_radius: 0.075
+  max_codes_per_bucket: 24
+  max_codes_per_bucket_overrides:
+    aux_8bar_step0_topo_*: 64
+    aux_9bar_step0_topo_*: 64
+    semantic_9bar_step1_topo_5_2_0: 128
+    semantic_9bar_step1_topo_5_2_1: 128
+    semantic_9bar_step1_topo_5_3_1: 128
+    semantic_9bar_step1_topo_5_4_0: 128
+    semantic_9bar_step1_topo_5_4_1: 128
+    semantic_9bar_step1_topo_6_4_0: 128
+    semantic_9bar_step1_topo_6_4_1: 128
+  representative_strategy: validity_best_medoid
+  max_validation_candidates: 32
+  max_validation_contexts: 96
+  fine_buckets:
+    enabled: true
+    complex_families: ["8bar", "9bar"]
+    semantic_only: false
+    include_step_index: true
+    include_action_topo: true
+    include_topology_signature_when_available: false
+
+il_training:
+  initial_checkpoint: null
+  batch_size: 4096
+  learning_rate: 0.0002
+  w_action: 1.0
+  w_geometry_code: 1.0
+  w_stop: 1.0
+  w_step_role: 0.5
+  w_step_count: 0.1
+  use_bucket_masked_code_loss: true
+  max_steps_per_family_role: 4096
+  val_ratio: 0.1
+  test_ratio: 0.1
+  split_seed: 23
+  patience: 10
+  max_reconstruction_traces: 256
+  max_reconstruction_traces_per_family: 64
+  oracle_code_loss:
+    enabled: true
+    positive_error_threshold: 0.15
+    soft_temperature: 0.02
+    w_hard_code_ce: 0.25
+    w_soft_oracle_ce: 1.0
+    w_pairwise_rank: 1.0
+    w_validity_margin: 1.0
+    rank_margin: 0.5
+    validity_margin: 0.25
+  rollout_aware:
+    enabled: false
+  curriculum_stages:
+    - name: stage_b_complex_oracle_rank_fineaux
+      families: ["8bar", "9bar"]
+      epochs: 30
+      patience: 8
+    - name: stage_c_family_oracle_rank_fineaux
+      families: ["6bar", "7bar", "8bar", "9bar"]
+      epochs: 40
+      patience: 10
+
+diagnostics:
+  constrained_code_topk: 10
+
+links_pretrain:
+  enabled: false
+
+family_index:
+  build_on_train: false
+  export_jsonl: false
+
+constraints:
+  min_link_length: 0.05
+  min_node_distance: 0.01
+  intersection_eps: 1.0e-8
+
+# 几何码选择策略（推理/rollout 选码阶段，PPOAgent 读取）。
+# use_sigma_flip: 选码时除原始分支外额外尝试 sigma 翻转变体（原始分支优先），
+#   在不扩码本的前提下扩展有效候选集，直接缓解复杂 family 的 edge_intersection / decode 失败。
+# use_incremental_validation: 用 validate_j_operator_candidate 只校验新增 dyad 的 4 条边（O(E)），
+#   与全量 validate_graph_structure 等价但更快，使穷举桶内候选基本免费。
+geometry_code_selection:
+  use_sigma_flip: true
+  use_incremental_validation: true
+
+paths:
+  # 数据集: 复用已构建的 v8 fineaux multistep + v2 codebook（--skip_extract）
+  pkl_dataset: "F:/LINKS4Meta/demo_code/LINKS-main/output/data_gen_v2_final80k_20260331/diverse_dataset_v2.pkl"
+  precomputed_split_input: "F:/LINKS4Meta/demo_code/LINKS-main/output/data_gen_v2_final80k_20260331/split_indices_v2.json"
+  links_pretrain_input: "F:/LINKS4Meta/demo_code/LINKS-main/output/data_gen_v2_final80k_20260331/diverse_dataset_v2.pkl"
+  links_pretrain_cache_output: "F:/LINKS4Meta/demo/outputs/pretrain/links_pretrain_cache.pt"
+  links_pretrain_model_output: "F:/LINKS4Meta/demo/outputs/checkpoints/graphmetamat_links/model_inverse_links_pretrain.pt"
+  links_pretrain_report_output: "F:/LINKS4Meta/demo/outputs/reports/links_pretrain_report.json"
+  forward_model: "F:/LINKS4Meta/demo/outputs/checkpoints/graphmetamat_links_phase3_full/model_bio_best.pt"
+  config_forward: "config_model_bio.yaml"
+  il_dataset_output: "F:/LINKS4Meta/demo/outputs/il_v8/data/il_expert_paths_multibase_fineaux_seed23.pt"
+  il_multistep_dataset_output: "F:/LINKS4Meta/demo/outputs/il_v8/data/il_expert_paths_multistep_fineaux_seed23.pt"
+  # 输出: 新 merge_newarch 路径，不覆盖 newarch / v8
+  il_model_output: "F:/LINKS4Meta/demo/outputs/il_v8/merge_newarch/checkpoints/model_inverse_il_merge_newarch_oracle.pt"
+  il_plot_output: "F:/LINKS4Meta/demo/outputs/il_v8/merge_newarch/reports/il_loss_curve_merge_newarch_oracle.png"
+  il_report_output: "F:/LINKS4Meta/demo/outputs/il_v8/merge_newarch/reports/il_training_report_merge_newarch_oracle.json"
+  il_split_output: "F:/LINKS4Meta/demo/outputs/il_v8/merge_newarch/reports/il_split_indices_merge_newarch_oracle.pt"
+  family_index_output_dir: "F:/LINKS4Meta/demo/outputs/il_v8/merge_newarch/family_index"
+  rl_model_output: "F:/LINKS4Meta/demo/outputs/checkpoints/graphmetamat_links/model_inverse_rl_merge_newarch.pt"

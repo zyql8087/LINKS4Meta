@@ -17,7 +17,7 @@ from torch_geometric.data import Batch, Data
 from torch_geometric.utils import scatter
 
 from src.inverse.action_codebook import (
-    decode_local_dyad_code,
+    decode_local_dyad_code_candidates,
     family_name_from_index,
     resolve_codebook_bucket_for_step,
     step_role_for_index,
@@ -117,6 +117,11 @@ class PPOAgent:
         self.geometry_samples_per_topology = int(rl_cfg.get('geometry_samples_per_topology', 4))
         self.geometry_prior_clearance_scale = float(rl_cfg.get('geometry_prior_clearance_scale', 1.0))
         self.constraint_cfg = cfg.get('constraints', {})
+
+        # 几何码选择策略：sigma 翻转候选扩展 + 增量验证，用于复杂 family 更稳地选出合法码。
+        selection_cfg = cfg.get('geometry_code_selection', {}) or {}
+        self.use_sigma_flip = bool(selection_cfg.get('use_sigma_flip', True))
+        self.use_incremental_validation = bool(selection_cfg.get('use_incremental_validation', True))
 
         hidden_dim = int(cfg.get('gnn_policy', {}).get('hidden_dim', 128))
         latent_dim = int(cfg.get('curve_encoder', {}).get('latent_dim', 128))
@@ -316,7 +321,11 @@ class PPOAgent:
         两阶段采样：先按节点概率乘积采样拓扑，再从 codebook 中采样几何编码。
         通过先验检查和完整验证后返回第一个合法动作。
         """
-        from src.inverse.rl_env import apply_j_operator, validate_graph_structure
+        from src.inverse.rl_env import (
+            apply_j_operator,
+            validate_graph_structure,
+            validate_j_operator_candidate,
+        )
 
         topologies = self._enumerate_topologies(graph)
         diagnostics = {
@@ -326,6 +335,7 @@ class PPOAgent:
             'structure_rejects': 0,
             'code_decode_reasons': Counter(),
             'structure_reasons': Counter(),
+            'sigma_flip_used': 0,
             'valid_action': False,
         }
 
@@ -374,34 +384,54 @@ class PPOAgent:
             else:
                 code_order = self._sample_order_from_probabilities(code_probs)
 
+            pos_u = graph.pos[u].detach().cpu().numpy()
+            pos_v = graph.pos[v].detach().cpu().numpy()
+            pos_w = graph.pos[w].detach().cpu().numpy()
+
             for code_local_idx in code_order:
                 diagnostics['sampled_codes'] += 1
                 code_id = int(allowed_code_ids[code_local_idx])
-                try:
-                    n1, n2 = decode_local_dyad_code(
-                        graph.pos[u].detach().cpu().numpy(),
-                        graph.pos[v].detach().cpu().numpy(),
-                        graph.pos[w].detach().cpu().numpy(),
-                        self.policy.action_codebook[code_id].detach().cpu().numpy(),
-                    )
-                except Exception as exc:
+                # 解码该码的分支（含可选 sigma 翻转变体），原始分支在最前。
+                candidates = decode_local_dyad_code_candidates(
+                    pos_u, pos_v, pos_w,
+                    self.policy.action_codebook[code_id].detach().cpu().numpy(),
+                    include_sigma_flips=self.use_sigma_flip,
+                )
+                if not candidates:
                     diagnostics['code_decode_rejects'] += 1
-                    diagnostics['code_decode_reasons'][type(exc).__name__] += 1
+                    diagnostics['code_decode_reasons']['decode_no_branch'] += 1
                     continue
 
-                is_prior_valid, prior_reason = self._passes_geometry_prior(graph, u, v, w, n1, n2)
-                if not is_prior_valid:
-                    diagnostics['code_decode_rejects'] += 1
-                    diagnostics['code_decode_reasons'][prior_reason] += 1
-                    continue
+                accepted = None
+                for variant_rank, (n1, n2, _variant_code) in enumerate(candidates):
+                    is_prior_valid, prior_reason = self._passes_geometry_prior(graph, u, v, w, n1, n2)
+                    if not is_prior_valid:
+                        diagnostics['code_decode_reasons'][prior_reason] += 1
+                        continue
 
-                candidate_graph = apply_j_operator(graph, u, v, w, n1, n2)
-                is_valid, valid_info = validate_graph_structure(candidate_graph, self.constraint_cfg)
-                if not is_valid:
+                    if self.use_incremental_validation:
+                        is_valid, valid_info = validate_j_operator_candidate(
+                            graph, u, v, w, n1, n2, self.constraint_cfg,
+                        )
+                        candidate_graph = None
+                    else:
+                        candidate_graph = apply_j_operator(graph, u, v, w, n1, n2)
+                        is_valid, valid_info = validate_graph_structure(candidate_graph, self.constraint_cfg)
+                    if not is_valid:
+                        diagnostics['structure_reasons'][valid_info.get('reason', 'invalid_structure')] += 1
+                        continue
+
+                    accepted = (n1, n2, variant_rank, candidate_graph)
+                    break
+
+                if accepted is None:
+                    # 该码的所有分支都被先验/结构检查拒绝。
                     diagnostics['structure_rejects'] += 1
-                    diagnostics['structure_reasons'][valid_info.get('reason', 'invalid_structure')] += 1
                     continue
 
+                n1, n2, variant_rank, _candidate_graph = accepted
+                if variant_rank > 0:
+                    diagnostics['sigma_flip_used'] += 1
                 diagnostics['valid_action'] = True
                 diagnostics['chosen_topology'] = (u, v, w)
                 diagnostics['chosen_code_id'] = code_id
@@ -506,30 +536,46 @@ class PPOAgent:
             candidate_graph = None
             action = None
             chosen_code_prob = 0.0
+            pos_u = graph.pos[u].detach().cpu().numpy()
+            pos_v = graph.pos[v].detach().cpu().numpy()
+            pos_w = graph.pos[w].detach().cpu().numpy()
+            from src.inverse.rl_env import (
+                apply_j_operator,
+                validate_graph_structure,
+                validate_j_operator_candidate,
+            )
             for code_local_idx in code_order:
                 code_id = int(allowed_code_ids[code_local_idx])
-                try:
-                    n1, n2 = decode_local_dyad_code(
-                        graph.pos[u].detach().cpu().numpy(),
-                        graph.pos[v].detach().cpu().numpy(),
-                        graph.pos[w].detach().cpu().numpy(),
-                        self.policy.action_codebook[code_id].detach().cpu().numpy(),
-                    )
-                except Exception:
+                branches = decode_local_dyad_code_candidates(
+                    pos_u, pos_v, pos_w,
+                    self.policy.action_codebook[code_id].detach().cpu().numpy(),
+                    include_sigma_flips=self.use_sigma_flip,
+                )
+                if not branches:
                     continue
-                is_prior_valid, _ = self._passes_geometry_prior(graph, u, v, w, n1, n2)
-                if not is_prior_valid:
-                    continue
-                try:
-                    from src.inverse.rl_env import apply_j_operator, validate_graph_structure
-                    candidate_graph = apply_j_operator(graph, u, v, w, n1, n2)
-                    is_valid, _ = validate_graph_structure(candidate_graph, self.constraint_cfg)
-                    if not is_valid:
-                        candidate_graph = None
+                chosen = None
+                for n1, n2, _variant in branches:
+                    is_prior_valid, _ = self._passes_geometry_prior(graph, u, v, w, n1, n2)
+                    if not is_prior_valid:
                         continue
-                except Exception:
-                    candidate_graph = None
+                    try:
+                        if self.use_incremental_validation:
+                            is_valid, _ = validate_j_operator_candidate(
+                                graph, u, v, w, n1, n2, self.constraint_cfg,
+                            )
+                            built_graph = apply_j_operator(graph, u, v, w, n1, n2) if is_valid else None
+                        else:
+                            built_graph = apply_j_operator(graph, u, v, w, n1, n2)
+                            is_valid, _ = validate_graph_structure(built_graph, self.constraint_cfg)
+                    except Exception:
+                        continue
+                    if not is_valid:
+                        continue
+                    chosen = (n1, n2, built_graph)
+                    break
+                if chosen is None:
                     continue
+                n1, n2, candidate_graph = chosen
                 chosen_code_prob = float(code_probs[code_local_idx])
                 action = {
                     'u': int(u), 'v': int(v), 'w': int(w),

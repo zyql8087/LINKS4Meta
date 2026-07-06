@@ -29,6 +29,10 @@ OPTIONAL_POLICY_MISSING_PREFIXES = (
     "action_u_head.",
     "action_v_head.",
     "action_w_head.",
+    # 条件融合改造新增层（旧 checkpoint 可缺省，零初始化等价于旧行为）
+    "graph_feat_norm.",
+    "cond_norm.",
+    "film.",
 )
 
 
@@ -193,12 +197,24 @@ class GNNPolicy(nn.Module):
         self.step_index_embedding = nn.Embedding(self.max_step_count + 1, step_embedding_dim)
         self.step_count_embedding = nn.Embedding(self.max_step_count + 1, step_embedding_dim)
 
+        # 融合前对齐：对图级特征和曲线条件各自做 LayerNorm，平衡两者幅值，
+        # 避免范数较大的图特征淹没曲线条件（batch-size 无关，兼容 RL batch=1）。
+        self.graph_feat_norm = nn.LayerNorm(hidden_dim)
+        self.cond_norm = nn.LayerNorm(self.curve_latent_dim)
+
         # 上下文 MLP: 融合图特征、曲线编码和各种嵌入
         context_input_dim = hidden_dim + self.curve_latent_dim + family_embedding_dim + step_embedding_dim * 2
         self.context_mlp = nn.Sequential(
             nn.Linear(context_input_dim, context_hidden_dim), nn.ELU(),
             nn.Linear(context_hidden_dim, context_hidden_dim), nn.ELU(),
         )
+
+        # FiLM 节点级条件调制：由曲线条件 z_c 生成逐通道 (gamma, beta)，
+        # 对每个节点的图嵌入做仿射调制，使节点级动作选择(u/v/w)依赖于目标曲线。
+        # 零初始化 -> 初始 gamma=beta=0 -> 等价于不调制，便于在旧 checkpoint 上热启动。
+        self.film = nn.Linear(self.curve_latent_dim, 2 * hidden_dim)
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
 
         # 动作预测头: 为每个节点预测被选为 u/v/w 的分数
         node_head_input_dim = hidden_dim + context_hidden_dim
@@ -247,6 +263,14 @@ class GNNPolicy(nn.Module):
             batch_index = torch.zeros(x_enc.size(0), dtype=torch.long, device=x_enc.device)
         return batch_index
 
+    def _prepare_condition(self, z_c: torch.Tensor | None, num_graphs: int, ref: torch.Tensor) -> torch.Tensor:
+        """规范化曲线条件向量：处理 None/一维输入，并做 LayerNorm 对齐。返回 (num_graphs, curve_latent_dim)。"""
+        if z_c is None:
+            z_c = torch.zeros((num_graphs, self.curve_latent_dim), dtype=ref.dtype, device=ref.device)
+        elif z_c.dim() == 1:
+            z_c = z_c.unsqueeze(0)
+        return self.cond_norm(z_c)
+
     def build_il_context(
         self, data, x_enc: torch.Tensor, z_c: torch.Tensor | None,
         family_ids: torch.Tensor | None = None, step_indices: torch.Tensor | None = None,
@@ -257,10 +281,9 @@ class GNNPolicy(nn.Module):
         graph_feat = scatter(x_enc, batch_index, dim=0, reduce="mean")
         num_graphs = graph_feat.size(0)
 
-        if z_c is None:
-            z_c = torch.zeros((num_graphs, self.curve_latent_dim), dtype=x_enc.dtype, device=x_enc.device)
-        elif z_c.dim() == 1:
-            z_c = z_c.unsqueeze(0)
+        # 融合前对齐：图特征与曲线条件各自归一化
+        graph_feat = self.graph_feat_norm(graph_feat)
+        z_c = self._prepare_condition(z_c, num_graphs, x_enc)
 
         if family_ids is None:
             family_ids = torch.full((num_graphs,), self.num_families, dtype=torch.long, device=x_enc.device)
@@ -292,8 +315,15 @@ class GNNPolicy(nn.Module):
             data, x_enc, z_c, family_ids=family_ids,
             step_indices=step_indices, step_counts=step_counts,
         )
+        # FiLM 节点级条件调制：用曲线条件生成 (gamma, beta)，逐节点仿射调制图嵌入，
+        # 使 u/v/w 节点打分依赖于目标曲线。零初始化时等价于 x_enc 不变。
+        num_graphs = context.size(0)
+        z_c_norm = self._prepare_condition(z_c, num_graphs, x_enc)
+        gamma, beta = self.film(z_c_norm).chunk(2, dim=-1)
+        x_mod = x_enc * (1.0 + gamma[batch_index]) + beta[batch_index]
+
         node_context = context[batch_index]
-        node_inputs = torch.cat([x_enc, node_context], dim=-1)
+        node_inputs = torch.cat([x_mod, node_context], dim=-1)
 
         return {
             "graph_context": context,

@@ -13,7 +13,11 @@ import torch
 from torch_geometric.data import Batch, Data
 
 from src.inverse.experiment_utils import compute_joint_metrics_batch, compute_reward_batch
-from src.inverse.rl_env import _prepare_graph_for_surrogate, validate_graph_structure
+from src.inverse.rl_env import (
+    _build_surrogate_readout_assigner,
+    _prepare_graph_for_surrogate,
+    validate_graph_structure,
+)
 
 
 def compute_batched_rewards(
@@ -44,11 +48,13 @@ class MCTS:
     逐步展开候选轨迹，保留得分最高的 beam_width 条，最后用代理模型评分选最优。
     """
 
-    def __init__(self, agent, surrogate, cfg: dict, device):
+    def __init__(self, agent, surrogate, cfg: dict, device, *, readout_assigner=None):
         self.agent = agent
         self.surrogate = surrogate
         self.cfg = cfg
         self.device = device
+        # 可选注入 readout 分配器（如 GPU 加速版）；None 时每次评分内部按默认构建，行为不变。
+        self.readout_assigner = readout_assigner
         mcts_cfg = cfg.get("mcts", {})
         self.branch_top_k = int(mcts_cfg.get("top_k_rollouts", mcts_cfg.get("num_rollouts", 8)))
         self.beam_width = int(mcts_cfg.get("beam_width", self.branch_top_k))
@@ -143,6 +149,15 @@ class MCTS:
                 valid_scored_indices.append(len(scored) - 1)
 
         if valid_candidates:
+            # 生成图(经 J 展开)没有 keypoints/8 维语义，hip 等语义角色必须由 readout 分配器赋予；
+            # 否则 surrogate 的 _validate_semantic_roles 会因 hip 节点数=0 报错。与 reward 主路径
+            # (rl_env.batch_compute_rewards)一致，用 surrogate-target readout 分配器（部署态默认）。
+            # 优先用外部注入的分配器（可为 GPU 加速版）。
+            readout_assigner = self.readout_assigner or _build_surrogate_readout_assigner(
+                self.surrogate, self.cfg.get("reward", {}), self.device,
+                family_index=family_index, step_index=expected_j_steps,
+                expected_j_steps=expected_j_steps,
+            )
             prepared_graphs = [
                 _prepare_graph_for_surrogate(
                     candidate.graph,
@@ -150,9 +165,18 @@ class MCTS:
                     step_index=candidate.step_count,
                     expected_j_steps=expected_j_steps,
                     target=target,
+                    readout_assigner=readout_assigner,
                 )
                 for candidate in valid_candidates
             ]
+            # 同一 beam 内候选可能混有"已 J 展开图"(无 keypoints, 由 apply_j_operator 丢弃)
+            # 与"停止候选"(base 图深拷贝, 保留 keypoints), 导致 Batch.from_data_list 在
+            # collate 这些不一致的纯索引属性时 KeyError。surrogate 只用已物化的 semantic
+            # mask / 8 维特征, keypoints/knee_idx 在这里是 vestigial, 批前统一剥除即可。
+            for graph in prepared_graphs:
+                for attr in ("keypoints", "knee_idx"):
+                    if attr in graph:
+                        del graph[attr]
             batch = Batch.from_data_list(prepared_graphs).to(self.device)
             with torch.no_grad():
                 pred_foot, pred_knee, pred_ankle = self.surrogate(batch)

@@ -713,10 +713,17 @@ class SurrogateTargetReadoutAssignment:
         family_index: int | None = None,
         step_index: int | None = None,
         expected_j_steps: int | None = None,
+        max_surrogate_candidates: int | None = None,
     ):
         self.surrogate_model = surrogate_model
         self.top_k = int(top_k)
         self.batch_size = int(batch_size)
+        # 仅对 rule-prior 排名前 N 的候选跑 surrogate（None=全跑，保持原行为）。
+        # rule_score 已含 foot/knee/ankle 目标误差先验，是有效筛子；剪枝只会让最终
+        # 选中的 readout 略保守（joint_score 不会更优），不会高估命中。
+        self.max_surrogate_candidates = (
+            int(max_surrogate_candidates) if max_surrogate_candidates else None
+        )
         self.metric_cfg = dict(metric_cfg or {})
         self.structural_prior_weight = float(structural_prior_weight)
         self.require_consecutive_semantic_chain = bool(require_consecutive_semantic_chain)
@@ -756,6 +763,10 @@ class SurrogateTargetReadoutAssignment:
         )
         if not candidates:
             return None
+
+        # 用无 surrogate 的 rule_score 先粗排，只对 top-N 跑 surrogate（GPU 大头在此）。
+        if self.max_surrogate_candidates is not None and len(candidates) > self.max_surrogate_candidates:
+            candidates = sorted(candidates, key=lambda c: c.score, reverse=True)[: self.max_surrogate_candidates]
 
         target_dict = _assignment_target_to_tensor_dict(target_obj)
         resolved_family = self.family_index if family_index is None else family_index

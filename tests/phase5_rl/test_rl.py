@@ -140,7 +140,14 @@ class TestPhase5RL(unittest.TestCase):
         with mock.patch.object(agent, "_topology_distribution", return_value=([(1, 2, 0)], np.array([1.0], dtype=np.float64))):
             with mock.patch.object(agent, "_masked_code_distribution", return_value=([0, 1], np.array([0.50000001, 0.50000001], dtype=np.float64))):
                 with mock.patch.object(agent, "_passes_geometry_prior", return_value=(True, None)):
-                    with mock.patch("src.inverse.rl_agent.decode_local_dyad_code", return_value=(np.array([0.2, 0.7], dtype=np.float32), np.array([0.2, 0.3], dtype=np.float32))):
+                    with mock.patch(
+                        "src.inverse.rl_agent.decode_local_dyad_code_candidates",
+                        return_value=[(
+                            np.array([0.2, 0.7], dtype=np.float32),
+                            np.array([0.2, 0.3], dtype=np.float32),
+                            np.zeros(6, dtype=np.float32),
+                        )],
+                    ):
                         actions, _, _, diagnostics = agent.batch_select_actions(
                             [_base_4bar_graph()],
                             torch.zeros((1, 8), dtype=torch.float32),

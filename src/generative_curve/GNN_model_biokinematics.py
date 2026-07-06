@@ -35,6 +35,7 @@ class BioKinematicsGNN(nn.Module):
             dim_input_edges=1,
             n_layers=encoder_cfg.get("num_layers", 4),
             dim_hidden=self.hidden_dim,
+            conv_type=encoder_cfg.get("type", "MPNN"),
             dropout=encoder_cfg.get("dropout", 0.1),
         )
 
@@ -85,16 +86,19 @@ class BioKinematicsGNN(nn.Module):
 
         family_id = getattr(data, "family_id", None)
         if family_id is None:
-            family_id = torch.zeros(num_graphs, dtype=torch.long, device=data.x.device)
+            raise ValueError("Missing forward family_id; expected one family id per graph.")
         else:
             family_id = family_id.view(-1).long()
-            if family_id.numel() < num_graphs:
-                padded = torch.zeros(num_graphs, dtype=torch.long, device=data.x.device)
-                padded[: family_id.numel()] = family_id
-                family_id = padded
-            else:
-                family_id = family_id[:num_graphs]
-            family_id = family_id.clamp(min=0, max=max(self.num_families - 1, 0))
+            if family_id.numel() != num_graphs:
+                raise ValueError(
+                    f"Expected {num_graphs} forward family_id values, got {family_id.numel()}."
+                )
+            invalid_family = (family_id < 0) | (family_id >= self.num_families)
+            if bool(invalid_family.any().item()):
+                bad_values = family_id[invalid_family].detach().cpu().tolist()
+                raise ValueError(
+                    f"Unknown forward family_id values {bad_values}; expected ids in [0, {self.num_families - 1}]."
+                )
 
         step_context = getattr(data, "step_context", None)
         if step_context is None:
@@ -162,8 +166,56 @@ class BioKinematicsGNN(nn.Module):
         mask_all = torch.ones(num_nodes, dtype=torch.bool, device=data.x.device)
         return mask_all, mask_all, mask_all
 
+    @staticmethod
+    def _semantic_roles_for_validation(data):
+        if hasattr(data, "mask_foot") and data.mask_foot is not None:
+            return {
+                "hip": getattr(data, "mask_hip", None),
+                "knee": getattr(data, "mask_knee", None),
+                "ankle": getattr(data, "mask_ankle", None),
+                "foot": data.mask_foot,
+            }
+
+        semantic_roles = data.x[:, -4:]
+        return {
+            "hip": semantic_roles[:, 0] > 0.5,
+            "knee": semantic_roles[:, 1] > 0.5,
+            "ankle": semantic_roles[:, 2] > 0.5,
+            "foot": semantic_roles[:, 3] > 0.5,
+        }
+
+    @staticmethod
+    def _validate_semantic_roles(data):
+        role_masks = BioKinematicsGNN._semantic_roles_for_validation(data)
+        batch_idx = data.batch
+        num_graphs = int(batch_idx.max().item()) + 1 if batch_idx.numel() > 0 else 1
+        for role_name in ("hip", "knee", "ankle", "foot"):
+            mask = role_masks.get(role_name)
+            if mask is None:
+                raise ValueError(f"Missing semantic role '{role_name}' mask for forward surrogate input.")
+            mask = mask.to(device=batch_idx.device, dtype=torch.bool).view(-1)
+            if mask.numel() != batch_idx.numel():
+                raise ValueError(
+                    f"Semantic role '{role_name}' mask length {mask.numel()} does not match node count {batch_idx.numel()}."
+                )
+            counts = scatter(mask.float(), batch_idx, dim=0, dim_size=num_graphs, reduce="sum")
+            bad = torch.nonzero(counts != 1, as_tuple=False).view(-1)
+            if bad.numel() > 0:
+                bad_counts = [(int(idx.item()), float(counts[idx].item())) for idx in bad[:5]]
+                raise ValueError(
+                    f"Each graph must contain exactly one semantic role '{role_name}' node; "
+                    f"bad graph counts={bad_counts}."
+                )
+
     def forward(self, data):
         """前向传播：GNN编码 -> 语义池化 -> 拼接上下文 -> 解码输出 (pred_foot, pred_knee, pred_ankle)。"""
+        if data.x.size(-1) != self.node_input_dim:
+            raise ValueError(
+                f"Forward surrogate expected node feature width {self.node_input_dim}, "
+                f"got {data.x.size(-1)}. Call the surrogate graph adapter before scoring inverse graphs."
+            )
+        self._validate_semantic_roles(data)
+
         edge_attr = getattr(data, "edge_attr", None)
         if edge_attr is None:
             pos = data.pos if hasattr(data, "pos") and data.pos is not None else data.x[:, :2]

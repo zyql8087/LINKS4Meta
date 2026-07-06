@@ -17,7 +17,7 @@ if str(WORKSPACE_ROOT) not in sys.path:
 
 from src.config_utils import ensure_parent_dir, load_yaml_config, resolve_mapping_paths
 from src.inverse.action_codebook import (
-    decode_local_dyad_code,
+    decode_local_dyad_code_candidates,
     family_name_from_index,
     load_action_codebook,
     resolve_codebook_bucket_for_step,
@@ -46,6 +46,10 @@ def _parse_args():
     parser.add_argument("--max_traces_per_family", type=int, default=64)
     parser.add_argument("--max_examples_per_family", type=int, default=20)
     parser.add_argument("--top_k", type=int, default=10)
+    parser.add_argument(
+        "--sigma_flip", choices=("on", "off"), default="on",
+        help="diagnose() 与主 reranked rollout 是否启用分支符号翻转候选扩展（默认 on）。",
+    )
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
 
@@ -93,20 +97,30 @@ def _reason_key(reason) -> str:
     return str(reason)
 
 
-def _apply_code_vector(graph, topo, code_vec, constraints):
+def _apply_code_vector(graph, topo, code_vec, constraints, use_sigma_flip=False):
+    """解码并验证一个码。use_sigma_flip=True 时额外尝试分支符号翻转变体（原始分支优先），
+    返回第一个合法分支。validity 判定仍用全量 validate_graph_structure，保持与基线一致。"""
     try:
         u, v, w = [int(value) for value in topo]
         if min(u, v, w) < 0 or max(u, v, w) >= int(graph.pos.size(0)):
             return False, "topology_index_out_of_range", None
-        pred_geo = decode_local_dyad_code(
+        branches = decode_local_dyad_code_candidates(
             graph.pos[u].detach().cpu().numpy(),
             graph.pos[v].detach().cpu().numpy(),
             graph.pos[w].detach().cpu().numpy(),
             np.asarray(code_vec, dtype=np.float32),
+            include_sigma_flips=bool(use_sigma_flip),
         )
-        next_graph = apply_j_operator(graph, u, v, w, pred_geo[0], pred_geo[1])
-        is_valid, reason = validate_graph_structure(next_graph, constraints)
-        return bool(is_valid), _reason_key(reason), next_graph if is_valid else None
+        if not branches:
+            return False, "decode_no_branch", None
+        last_reason = None
+        for n1, n2, _variant in branches:
+            next_graph = apply_j_operator(graph, u, v, w, n1, n2)
+            is_valid, reason = validate_graph_structure(next_graph, constraints)
+            if is_valid:
+                return True, _reason_key(reason), next_graph
+            last_reason = _reason_key(reason)
+        return False, last_reason, None
     except Exception as exc:
         return False, type(exc).__name__, None
 
@@ -220,7 +234,7 @@ def _code_vec(policy, code_id: int):
     return policy.action_codebook[int(code_id)].detach().cpu().numpy()
 
 
-def _diagnose(policy, curve_encoder, paths, cfg, device, top_k: int, max_examples_per_family: int):
+def _diagnose(policy, curve_encoder, paths, cfg, device, top_k: int, max_examples_per_family: int, use_sigma_flip: bool = False):
     constraints = cfg.get("constraints", {})
     traces = group_paths_by_trace(paths)
     groups = defaultdict(_empty_group)
@@ -260,7 +274,8 @@ def _diagnose(policy, curve_encoder, paths, cfg, device, top_k: int, max_example
                 graph_by_rank = []
                 for code_id in ordered_ids:
                     is_valid, reason, next_graph = _apply_code_vector(
-                        current_graph, pred_topo, _code_vec(policy, code_id), constraints
+                        current_graph, pred_topo, _code_vec(policy, code_id), constraints,
+                        use_sigma_flip=use_sigma_flip,
                     )
                     valid_by_rank.append(bool(is_valid))
                     reason_by_rank.append(reason)
@@ -339,7 +354,7 @@ def _diagnose(policy, curve_encoder, paths, cfg, device, top_k: int, max_example
     }
 
 
-def _evaluate_validity_reranked_rollout(policy, curve_encoder, paths, cfg, device, top_k: int):
+def _evaluate_validity_reranked_rollout(policy, curve_encoder, paths, cfg, device, top_k: int, use_sigma_flip: bool = False):
     constraints = cfg.get("constraints", {})
     traces = group_paths_by_trace(paths)
     by_family = defaultdict(lambda: {
@@ -385,7 +400,8 @@ def _evaluate_validity_reranked_rollout(policy, curve_encoder, paths, cfg, devic
                 selected_graph = None
                 for rank, code_id in enumerate(prediction["ordered_code_ids"], start=1):
                     is_valid, _, next_graph = _apply_code_vector(
-                        current_graph, pred_topo, _code_vec(policy, code_id), constraints
+                        current_graph, pred_topo, _code_vec(policy, code_id), constraints,
+                        use_sigma_flip=use_sigma_flip,
                     )
                     if is_valid:
                         selected_rank = rank
@@ -476,6 +492,7 @@ def main():
             "max_traces_per_family": int(args.max_traces_per_family),
             "max_examples_per_family": int(args.max_examples_per_family),
             "top_k": int(args.top_k),
+            "sigma_flip": str(args.sigma_flip),
             "num_codebook_entries": int(len(action_codebook.get("entries", []))),
             "bucket_sizes": {
                 str(key): int(len(value))
@@ -491,7 +508,10 @@ def main():
             device,
             int(args.top_k),
             int(args.max_examples_per_family),
+            use_sigma_flip=(args.sigma_flip == "on"),
         ),
+        # A/B：同一组 held-out trace 上，分别在「无 sigma 翻转」与「有 sigma 翻转」下
+        # 跑 validity-reranked rollout，直接量出 sigma 翻转对各 family 合法选码率的增量。
         "validity_reranked_rollout": _evaluate_validity_reranked_rollout(
             bundle["policy"],
             bundle["curve_encoder"],
@@ -499,6 +519,16 @@ def main():
             cfg,
             device,
             int(args.top_k),
+            use_sigma_flip=False,
+        ),
+        "validity_reranked_rollout_sigma_flip": _evaluate_validity_reranked_rollout(
+            bundle["policy"],
+            bundle["curve_encoder"],
+            selected_paths,
+            cfg,
+            device,
+            int(args.top_k),
+            use_sigma_flip=True,
         ),
     }
 

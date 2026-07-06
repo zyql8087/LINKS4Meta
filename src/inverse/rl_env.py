@@ -175,19 +175,26 @@ def _build_surrogate_readout_assigner(
     family_index: int,
     step_index: int,
     expected_j_steps: int,
+    batch_size: int = 64,
+    max_surrogate_candidates: Optional[int] = None,
 ):
-    """构建基于 surrogate 模型的 readout 分配器。"""
+    """构建基于 surrogate 模型的 readout 分配器。
+
+    batch_size / max_surrogate_candidates 用于 GPU 加速：增大批、并把 surrogate 评分
+    限制在 rule-prior top-N 候选上（默认 None=全量，保持原行为，不影响既有调用方）。
+    """
     if surrogate is None:
         return None
     return SurrogateTargetReadoutAssignment(
         surrogate,
         top_k=3,
-        batch_size=64,
+        batch_size=int(batch_size),
         metric_cfg=reward_cfg or {},
         device=device,
         family_index=int(family_index),
         step_index=int(step_index),
         expected_j_steps=int(expected_j_steps),
+        max_surrogate_candidates=max_surrogate_candidates,
     )
 
 
@@ -263,8 +270,14 @@ def _infer_semantic_masks(
             if 0 <= knee_idx < num_nodes:
                 mask_knee[knee_idx] = True
 
-    # 回退：使用 readout_assigner 进行规则分配
-    if allow_assignment_fallback and (not mask_knee.any() or not mask_ankle.any() or not mask_foot.any()):
+    # 回退：使用 readout_assigner 进行规则分配。
+    # hip 只能由 assigner 赋予：keypoints/knee_idx 分支只填 knee/ankle/foot（keypoints 仅 3 项），
+    # 故凡 hip 缺失也必须触发 assigner，否则 keypoints 图会带着 0 个 hip 节点进 surrogate，
+    # 被 _validate_semantic_roles 拒绝（生成图经 apply_j_operator 普遍构造 keypoints，必然命中）。
+    # 下方每个 mask 的 `if not ...any()` 守卫保证只补 hip、不覆盖已由 keypoints 定的 knee/ankle/foot。
+    if allow_assignment_fallback and (
+        not mask_hip.any() or not mask_knee.any() or not mask_ankle.any() or not mask_foot.any()
+    ):
         assigner = readout_assigner or _DEFAULT_READOUT_ASSIGNER
         assignment = assigner.assign(graph_data, target=target, motion=motion)
         if assignment is not None:
@@ -419,6 +432,75 @@ def validate_graph_structure(graph_data: Data, constraint_cfg: Optional[dict] = 
             return False, {'reason': 'invalid_keypoints', 'keypoints': keypoints}
         if len(set(keypoints)) != len(keypoints):
             return False, {'reason': 'duplicate_keypoints', 'keypoints': keypoints}
+
+    return True, {'reason': 'ok'}
+
+
+def validate_j_operator_candidate(
+    graph_data: Data, u: int, v: int, w: int,
+    n1_pos: np.ndarray, n2_pos: np.ndarray, constraint_cfg: Optional[dict] = None,
+):
+    """增量验证一次 J-Operator：在已合法的前缀图上插入 dyad (n1, n2) 后，只校验新增节点/边引入的违例。
+
+    前提：graph_data 自身已通过 validate_graph_structure（自回归构建中由归纳保证）。在此前提下，
+    新增 n1/n2 两个节点和 4 条边只可能引入与新元素相关的违例，因此结果与对全图重新调用
+    validate_graph_structure 等价，但复杂度从 O(N^2 + E^2) 降到 O(N + E)。
+    reason 字符串与 validate_graph_structure 保持一致（duplicate_nodes / short_edge / edge_intersection）。
+    返回 (is_valid, info)。
+    """
+    constraint_cfg = constraint_cfg or {}
+    min_link_length = float(constraint_cfg.get('min_link_length', 0.05))
+    min_node_distance = float(constraint_cfg.get('min_node_distance', 1e-3))
+    eps = float(constraint_cfg.get('intersection_eps', 1e-8))
+
+    pos = _to_numpy(graph_data.pos if getattr(graph_data, 'pos', None) is not None else graph_data.x[:, :2])
+    if pos.ndim != 2 or pos.shape[1] != 2:
+        return False, {'reason': 'invalid_position_shape'}
+    n1 = np.asarray(n1_pos, dtype=np.float64).reshape(-1)[:2]
+    n2 = np.asarray(n2_pos, dtype=np.float64).reshape(-1)[:2]
+    n_existing = pos.shape[0]
+    n1_idx, n2_idx = n_existing, n_existing + 1
+
+    # 新节点与已有节点、以及彼此的最小距离（重叠检测）
+    for idx in range(n_existing):
+        if np.linalg.norm(n1 - pos[idx]) < min_node_distance:
+            return False, {'reason': 'duplicate_nodes', 'nodes': (idx, n1_idx)}
+        if np.linalg.norm(n2 - pos[idx]) < min_node_distance:
+            return False, {'reason': 'duplicate_nodes', 'nodes': (idx, n2_idx)}
+    if np.linalg.norm(n1 - n2) < min_node_distance:
+        return False, {'reason': 'duplicate_nodes', 'nodes': (n1_idx, n2_idx)}
+
+    new_edges = [(int(u), n1_idx), (int(v), n1_idx), (n1_idx, n2_idx), (int(w), n2_idx)]
+    new_pos = {n1_idx: n1, n2_idx: n2}
+
+    def _pos_of(idx: int) -> np.ndarray:
+        return new_pos[idx] if idx in new_pos else pos[idx]
+
+    # 新增边的最小杆长
+    for a, b in new_edges:
+        if np.linalg.norm(_pos_of(a) - _pos_of(b)) < min_link_length:
+            return False, {'reason': 'short_edge', 'edge': (a, b)}
+
+    existing_edges = _sorted_undirected_edges(graph_data.edge_index)
+
+    # 新边 vs 已有边（共享端点的边对跳过，与全量验证一致）
+    for a, b in new_edges:
+        p_a, p_b = _pos_of(a), _pos_of(b)
+        for e_u, e_v in existing_edges:
+            if len({a, b, e_u, e_v}) < 4:
+                continue
+            if _segments_intersect(p_a, p_b, pos[e_u], pos[e_v], eps):
+                return False, {'reason': 'edge_intersection', 'edges': ((a, b), (e_u, e_v))}
+
+    # 新边 vs 新边
+    for idx_a in range(len(new_edges)):
+        a, b = new_edges[idx_a]
+        p_a, p_b = _pos_of(a), _pos_of(b)
+        for c, d in new_edges[idx_a + 1:]:
+            if len({a, b, c, d}) < 4:
+                continue
+            if _segments_intersect(p_a, p_b, _pos_of(c), _pos_of(d), eps):
+                return False, {'reason': 'edge_intersection', 'edges': ((a, b), (c, d))}
 
     return True, {'reason': 'ok'}
 

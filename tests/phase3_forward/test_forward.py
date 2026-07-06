@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 from torch_geometric.data import Batch
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
@@ -98,6 +99,81 @@ class TestPhase3Forward(unittest.TestCase):
         self.assertEqual(tuple(pred_foot.shape), (2, 200, 2))
         self.assertEqual(tuple(pred_knee.shape), (2, 200))
         self.assertEqual(tuple(pred_ankle.shape), (2, 200))
+
+    def test_config_encoder_type_matches_actual_forward_encoder(self):
+        cfg_path = GMM_ROOT / "src" / "config_model_bio.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+
+        model = BioKinematicsGNN(cfg)
+
+        self.assertEqual(cfg["encoder"]["type"], "MPNN")
+        self.assertEqual(model.encoder.conv_type, cfg["encoder"]["type"])
+
+    def test_forward_model_rejects_non_surrogate_node_feature_width(self):
+        data = sample_to_pyg(_mock_sample("6bar", 20), 0)
+        data.x = data.x[:, :4]
+        batch = Batch.from_data_list([data])
+        cfg = {
+            "encoder": {"hidden_dim": 16, "node_input_dim": 8, "num_layers": 2, "dropout": 0.0},
+            "decoder": {
+                "hidden_dim": 16,
+                "num_layers": 3,
+                "num_families": 4,
+                "family_embedding_dim": 8,
+                "step_context_input_dim": 3,
+                "step_context_hidden_dim": 8,
+            },
+            "training": {"curve_steps": 200},
+        }
+
+        model = BioKinematicsGNN(cfg)
+
+        with self.assertRaisesRegex(ValueError, "node feature width"):
+            model(batch)
+
+    def test_forward_model_rejects_incomplete_semantic_roles_per_graph(self):
+        data = sample_to_pyg(_mock_sample("6bar", 21), 0)
+        data.mask_ankle = torch.zeros_like(data.mask_ankle)
+        data.x[:, 6] = 0.0
+        batch = Batch.from_data_list([data])
+        cfg = {
+            "encoder": {"hidden_dim": 16, "node_input_dim": 8, "num_layers": 2, "dropout": 0.0},
+            "decoder": {
+                "hidden_dim": 16,
+                "num_layers": 3,
+                "num_families": 4,
+                "family_embedding_dim": 8,
+                "step_context_input_dim": 3,
+                "step_context_hidden_dim": 8,
+            },
+            "training": {"curve_steps": 200},
+        }
+
+        model = BioKinematicsGNN(cfg)
+
+        with self.assertRaisesRegex(ValueError, "semantic role 'ankle'"):
+            model(batch)
+
+    def test_forward_model_rejects_unknown_family_id(self):
+        data = sample_to_pyg(_mock_sample("unknown", 22), 0)
+        batch = Batch.from_data_list([data])
+        cfg = {
+            "encoder": {"hidden_dim": 16, "node_input_dim": 8, "num_layers": 2, "dropout": 0.0},
+            "decoder": {
+                "hidden_dim": 16,
+                "num_layers": 3,
+                "num_families": 4,
+                "family_embedding_dim": 8,
+                "step_context_input_dim": 3,
+                "step_context_hidden_dim": 8,
+            },
+            "training": {"curve_steps": 200},
+        }
+
+        model = BioKinematicsGNN(cfg)
+
+        with self.assertRaisesRegex(ValueError, "Unknown forward family_id"):
+            model(batch)
 
     def test_forward_metrics_zero_for_identical_targets(self):
         foot = torch.stack([torch.linspace(0, 1, 8), torch.linspace(1, 0, 8)], dim=-1).unsqueeze(0)

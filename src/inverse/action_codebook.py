@@ -353,6 +353,61 @@ def decode_local_dyad_code(
     return n1.astype(np.float32), n2.astype(np.float32)
 
 
+def sigma_flip_code_variants(code: Sequence[float]) -> list[np.ndarray]:
+    """生成码的分支符号 (sigma_1, sigma_2) 翻转变体，用于在不扩码本的前提下扩展有效候选集。
+
+    返回顺序：原始码（按位保留）在前，随后是翻转 sigma_1 / sigma_2 / 两者 的变体。
+    分支符号被归一化为 ±1（与 decode 的取号一致），并按符号实际取值去重，
+    因此返回 1~4 个变体。当圆-圆有两个交点时，翻转 sigma 会选到另一个交点，
+    这正是 edge_intersection / decode 失败时最常需要的"另一条分支"。
+    """
+    base = np.asarray(code, dtype=np.float32).reshape(-1)
+    if base.size != 6:
+        raise ValueError(f"expected 6-dim code, got shape {tuple(base.shape)}")
+    s1 = 1.0 if float(base[4]) >= 0.0 else -1.0
+    s2 = 1.0 if float(base[5]) >= 0.0 else -1.0
+    variants: list[np.ndarray] = [base.copy()]
+    seen: set[tuple[float, float]] = {(s1, s2)}
+    for new_s1, new_s2 in ((-s1, s2), (s1, -s2), (-s1, -s2)):
+        key = (new_s1, new_s2)
+        if key in seen:
+            continue
+        seen.add(key)
+        variant = base.copy()
+        variant[4] = np.float32(new_s1)
+        variant[5] = np.float32(new_s2)
+        variants.append(variant)
+    return variants
+
+
+def decode_local_dyad_code_candidates(
+    pos_i: np.ndarray, pos_j: np.ndarray, pos_w: np.ndarray, code: Sequence[float],
+    *, include_sigma_flips: bool = True, dedup_atol: float = 1.0e-6,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """解码一个码（含可选的 sigma 翻转变体），返回去重后的候选几何列表。
+
+    返回 [(n1, n2, variant_code), ...]，原始分支在最前；解码失败（无圆交点等）的变体被跳过，
+    几何上重复（n1/n2 落在同一位置）的变体也被去重。若所有变体都解码失败则返回空列表。
+    """
+    if include_sigma_flips:
+        variants = sigma_flip_code_variants(code)
+    else:
+        variants = [np.asarray(code, dtype=np.float32).reshape(-1)]
+    out: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    seen: list[np.ndarray] = []
+    for variant in variants:
+        try:
+            n1, n2 = decode_local_dyad_code(pos_i, pos_j, pos_w, variant)
+        except Exception:
+            continue
+        key = np.concatenate([n1, n2]).astype(np.float32)
+        if any(np.allclose(key, prev, atol=dedup_atol) for prev in seen):
+            continue
+        seen.append(key)
+        out.append((n1, n2, variant))
+    return out
+
+
 def _cluster_medoid(members: Sequence[tuple[int, np.ndarray]]) -> np.ndarray:
     """计算聚类质心（到所有成员距离之和最小的实际成员点）。"""
     return _cluster_medoid_member(members)[1].copy()
